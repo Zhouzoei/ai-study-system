@@ -4,6 +4,8 @@ import time
 import tempfile
 import shutil
 
+os.environ["QDRANT_URL"] = ""
+os.environ["QDRANT_API_KEY"] = ""
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.conversation_memory import ConversationMemory
@@ -258,11 +260,11 @@ Python is an object-oriented programming language. Classes are defined using the
 
         sid = session_info["session_id"]
 
-        q1 = pipeline.query("What are variables in Python?", session_id=sid, use_hybrid=False)
+        q1 = pipeline.query("What are variables in Python?", session_id=sid, use_hybrid=True)
         assert q1["num_contexts"] > 0
         print(f"[PASS] first query with session: {q1['num_contexts']} contexts (no history yet)")
 
-        q2 = pipeline.query("How do functions work?", session_id=sid, use_hybrid=False)
+        q2 = pipeline.query("How do functions work?", session_id=sid, use_hybrid=True)
         assert q2["num_contexts"] > 0
         conv_ctx = q2.get("conversation_context", [])
         print(f"[PASS] second query with session: {q2['num_contexts']} contexts, conv_history={len(conv_ctx)}")
