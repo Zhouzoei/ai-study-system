@@ -5,3 +5,4 @@ dashscope>=1.0
 qdrant-client>=1.0
 pypdf>=3.0
 plotly>=5.0
+jieba>=0.42

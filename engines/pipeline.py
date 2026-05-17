@@ -154,7 +154,7 @@ class EnhancedRAGPipeline:
             "doc_id": doc_id,
             "total_nodes": len(nodes),
             "level_counts": level_counts,
-            "exposed_knowledge_nodes": len(l3_nodes),
+            "exposed_knowledge_nodes": len(l2_nodes),
             "kg_entities": kg_result.get("total_entities", 0),
             "kg_relations": kg_result.get("total_relations", 0),
             "chunk_time_ms": round(chunk_time * 1000, 2),
