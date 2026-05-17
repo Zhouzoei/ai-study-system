@@ -258,11 +258,11 @@ Python is an object-oriented programming language. Classes are defined using the
 
         sid = session_info["session_id"]
 
-        q1 = pipeline.query("What are variables in Python?", session_id=sid)
+        q1 = pipeline.query("What are variables in Python?", session_id=sid, use_hybrid=False)
         assert q1["num_contexts"] > 0
         print(f"[PASS] first query with session: {q1['num_contexts']} contexts (no history yet)")
 
-        q2 = pipeline.query("How do functions work?", session_id=sid)
+        q2 = pipeline.query("How do functions work?", session_id=sid, use_hybrid=False)
         assert q2["num_contexts"] > 0
         conv_ctx = q2.get("conversation_context", [])
         print(f"[PASS] second query with session: {q2['num_contexts']} contexts, conv_history={len(conv_ctx)}")

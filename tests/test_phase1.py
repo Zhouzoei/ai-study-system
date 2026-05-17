@@ -2,6 +2,7 @@ import sys
 import os
 import time
 import json
+import pytest
 
 os.environ["PYTHONIOENCODING"] = "utf-8"
 os.environ["QDRANT_URL"] = ""
@@ -133,8 +134,7 @@ EVAL_QUESTIONS = [
     },
 ]
 
-
-def test_chunker():
+def _build_nodes():
     print("=" * 60)
     print("Test 1: Hierarchical Chunker")
     print("=" * 60)
@@ -186,6 +186,11 @@ def test_chunker():
     print(f"[PASS] All L2 have parent: True")
 
     return nodes
+
+
+@pytest.fixture
+def nodes():
+    return _build_nodes()
 
 
 def test_storage(nodes):
@@ -515,7 +520,7 @@ def main():
     results = {}
 
     try:
-        nodes = test_chunker()
+        nodes = _build_nodes()
         results["chunker"] = "PASS"
     except Exception as e:
         print(f"\n[FAIL] Chunker: {e}")
