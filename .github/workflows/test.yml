@@ -10,5 +10,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: pip install -r requirements.txt
-      - run: pytest tests/ -v
+      - name: Install dependencies
+        run: |
+          pip install pytest
+          pip install -r requirements.txt
+      - name: Create dummy .env for CI
+        run: |
+          echo "LLM_API_KEY=sk-dummy" >> .env
+          echo "EMBED_API_KEY=sk-dummy" >> .env
+          echo "QDRANT_URL=http://localhost:6333" >> .env
+          echo "QDRANT_API_KEY=dummy" >> .env
+      - name: Run tests
+        run: pytest tests/ -v
