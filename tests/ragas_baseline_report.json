@@ -1,0 +1,47 @@
+{
+  "vector_only": {
+    "strategy": "hybrid=False,reranker=False",
+    "num_samples": 20,
+    "avg_faithfulness": 0.96,
+    "avg_answer_relevancy": 1.0,
+    "avg_context_precision": 0.9397,
+    "avg_context_recall": 0.8512,
+    "avg_total_time_ms": 18631.43
+  },
+  "hybrid": {
+    "strategy": "hybrid=True,reranker=False",
+    "num_samples": 20,
+    "avg_faithfulness": 1.0,
+    "avg_answer_relevancy": 1.0,
+    "avg_context_precision": 0.9233,
+    "avg_context_recall": 0.8738,
+    "avg_total_time_ms": 24238.99
+  },
+  "hybrid_reranker": {
+    "strategy": "hybrid=True,reranker=True",
+    "num_samples": 20,
+    "avg_faithfulness": 1.0,
+    "avg_answer_relevancy": 0.95,
+    "avg_context_precision": 0.9277,
+    "avg_context_recall": 0.8535,
+    "avg_total_time_ms": 24206.78
+  },
+  "hybrid_rewrite": {
+    "strategy": "hybrid=True,reranker=False",
+    "num_samples": 20,
+    "avg_faithfulness": 1.0,
+    "avg_answer_relevancy": 1.0,
+    "avg_context_precision": 0.9233,
+    "avg_context_recall": 0.8508,
+    "avg_total_time_ms": 23178.83
+  },
+  "hybrid_rewrite_reranker": {
+    "strategy": "hybrid=True,reranker=True",
+    "num_samples": 20,
+    "avg_faithfulness": 1.0,
+    "avg_answer_relevancy": 1.0,
+    "avg_context_precision": 0.9452,
+    "avg_context_recall": 0.8441,
+    "avg_total_time_ms": 16668.24
+  }
+}
