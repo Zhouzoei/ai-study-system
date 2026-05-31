@@ -610,7 +610,6 @@ class EnhancedRAGPipeline:
             "total_time_ms": round(total_time * 1000, 2),
         }
 
-    @staticmethod
     def ask(
         self,
         question: str,
