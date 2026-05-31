@@ -183,14 +183,11 @@ class RAGASEvaluator:
 
     def _extract_score(self, response: str) -> float:
         response = response.strip()
-        for char in response:
-            if char in "0123456789.":
-                break
-        else:
+        if not response:
             return 0.5
 
         import re
-        numbers = re.findall(r"0?\.\d+|[01]\.?\d*", response)
+        numbers = re.findall(r"\b(0(?:\.\d+)?|1(?:\.0+)?)\b", response)
         if numbers:
             try:
                 score = float(numbers[0])
@@ -198,11 +195,15 @@ class RAGASEvaluator:
             except ValueError:
                 pass
 
-        try:
-            score = float(response.strip().split()[0])
-            return min(max(score, 0.0), 1.0)
-        except (ValueError, IndexError):
-            return 0.5
+        numbers = re.findall(r"\d+\.\d+", response)
+        if numbers:
+            try:
+                score = float(numbers[0])
+                return min(max(score, 0.0), 1.0)
+            except ValueError:
+                pass
+
+        return 0.5
 
     def _parse_binary_labels(self, response: str, expected_count: int) -> List[int]:
         import re

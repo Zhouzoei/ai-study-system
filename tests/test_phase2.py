@@ -8,19 +8,19 @@ os.environ["QDRANT_URL"] = ""
 os.environ["QDRANT_API_KEY"] = ""
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.conversation_memory import ConversationMemory
+from core.conversation_memory import LayeredMemory
 from core.learning_planner import LearningPlanner, PlanStatus, TaskPriority, LearningTask, LearningPlan
 from core.progress_tracker import ProgressTracker, MasteryLevel
 
 
 def test_conversation_memory():
-    print("\n=== ConversationMemory ===")
+    print("\n=== LayeredMemory ===")
 
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
         db_path = f.name
 
     try:
-        mem = ConversationMemory(db_path=db_path, max_window_size=5, summary_threshold=3)
+        mem = LayeredMemory(db_path=db_path, short_window_messages=5, medium_compress_threshold=3)
 
         session = mem.create_session(user_id="test_user", title="Test Session")
         assert session.session_id
@@ -35,9 +35,9 @@ def test_conversation_memory():
         mem.add_message(sid, "assistant", "Variables are containers for data.")
         print("[PASS] add_message x4")
 
-        context = mem.get_context_window(sid)
+        context = mem.get_short_term_context(sid)
         assert len(context) >= 4
-        print(f"[PASS] get_context_window: {len(context)} messages")
+        print(f"[PASS] get_short_term_context: {len(context)} messages")
 
         s = mem.get_session(sid)
         assert s is not None
@@ -59,11 +59,19 @@ def test_conversation_memory():
         assert "total_sessions" in stats
         print(f"[PASS] get_stats: {stats}")
 
-        mem.close()
-        print("[PASS] ConversationMemory all tests passed")
+        mem.db.close()
+        print("[PASS] LayeredMemory all tests passed")
     finally:
         if os.path.exists(db_path):
-            os.unlink(db_path)
+            try:
+                os.unlink(db_path)
+            except PermissionError:
+                for suffix in ("-shm", "-wal"):
+                    p = db_path + suffix
+                    if os.path.exists(p):
+                        try: os.unlink(p)
+                        except Exception: pass
+                os.unlink(db_path)
 
 
 def test_learning_planner():
@@ -142,7 +150,7 @@ def test_learning_planner():
         assert planner.get_plan(goal_plan.plan_id) is None
         print("[PASS] delete_plan")
 
-        planner.close()
+        planner.db.close()
         print("[PASS] LearningPlanner all tests passed")
     finally:
         if os.path.exists(db_path):
@@ -212,7 +220,7 @@ def test_progress_tracker():
         assert len(batch) == 3
         print("[PASS] batch_record_exposure")
 
-        tracker.close()
+        tracker.db.close()
         print("[PASS] ProgressTracker all tests passed")
     finally:
         if os.path.exists(db_path):

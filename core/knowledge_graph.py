@@ -1,5 +1,4 @@
 import json
-import sqlite3
 import uuid
 import re
 import difflib
@@ -7,7 +6,7 @@ from typing import List, Dict, Any, Optional, Callable, Set, Tuple
 from dataclasses import dataclass, field
 from collections import defaultdict
 
-from config import config
+from core.database import DatabaseManager, get_database, escape_like
 
 
 @dataclass
@@ -65,17 +64,27 @@ class Relation:
 class KnowledgeGraphBuilder:
     def __init__(
         self,
-        db_path: Optional[str] = None,
+        db: Optional[DatabaseManager] = None,
         llm_func: Optional[Callable] = None,
+        db_path: Optional[str] = None,
+        embed_func: Optional[Callable] = None,
     ):
-        self.db_path = db_path or config.HIERARCHICAL_TREE_DB.replace("tree_store", "knowledge_graph")
+        if db is not None:
+            self.db = db
+        elif db_path is not None:
+            self.db = get_database(db_path)
+        else:
+            self.db = get_database()
         self.llm_func = llm_func
+        self.embed_func = embed_func
+        self._alias_map: Dict[str, str] = {}
+        self._name_to_id: Dict[str, str] = {}
         self._init_db()
+        self._load_name_index()
 
     def _init_db(self):
-        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("""
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("""
             CREATE TABLE IF NOT EXISTS entities (
                 entity_id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -86,7 +95,7 @@ class KnowledgeGraphBuilder:
                 properties TEXT NOT NULL DEFAULT '{}'
             )
         """)
-        self.conn.execute("""
+        self.db.execute("""
             CREATE TABLE IF NOT EXISTS relations (
                 relation_id TEXT PRIMARY KEY,
                 source_entity_id TEXT NOT NULL,
@@ -97,22 +106,22 @@ class KnowledgeGraphBuilder:
                 doc_id TEXT NOT NULL DEFAULT ''
             )
         """)
-        self.conn.execute("""
+        self.db.execute("""
             CREATE INDEX IF NOT EXISTS idx_entity_name ON entities(name)
         """)
-        self.conn.execute("""
+        self.db.execute("""
             CREATE INDEX IF NOT EXISTS idx_entity_doc ON entities(doc_id)
         """)
-        self.conn.execute("""
+        self.db.execute("""
             CREATE INDEX IF NOT EXISTS idx_rel_source ON relations(source_entity_id)
         """)
-        self.conn.execute("""
+        self.db.execute("""
             CREATE INDEX IF NOT EXISTS idx_rel_target ON relations(target_entity_id)
         """)
-        self.conn.execute("""
+        self.db.execute("""
             CREATE INDEX IF NOT EXISTS idx_rel_type ON relations(relation_type)
         """)
-        self.conn.commit()
+        self.db.commit()
 
     def build_from_nodes(
         self,
@@ -128,24 +137,47 @@ class KnowledgeGraphBuilder:
         nodes: List[Dict],
         doc_id: str,
     ) -> Dict[str, Any]:
-        all_entities = []
-        all_relations = []
-
+        # Phase 1: rule-based NER on all nodes (free, no LLM calls)
         for node in nodes:
-            content = node.get("content", "")
-            node_id = node.get("node_id", "")
-            if not content.strip():
-                continue
+            ne, nr = self._extract_with_ner(
+                node.get("content", ""), node.get("node_id", ""), doc_id, node.get("title", "")
+            )
+            for e in ne:
+                self._save_entity(e)
+                self._name_to_id[e.name] = e.entity_id
+            for r in nr:
+                self._save_relation(r)
 
-            prompt = f"""请从以下文本中提取实体和关系，按JSON格式输出。
+        all_entities = list(self._load_all_entities_for_doc(doc_id))
+        all_relations = []
+        existing_names = {e.name for e in all_entities}
 
-文本:
-{content[:1500]}
+        if not self.llm_func:
+            return self._build_result(doc_id, all_entities, all_relations)
 
-请按以下格式输出:
+        # Phase 2: batch LLM extraction (BATCH_SIZE nodes per call)
+        BATCH_SIZE = 8
+        content_nodes = [n for n in nodes if n.get("content", "").strip()]
+        node_index = {n["node_id"]: n for n in content_nodes}
+
+        for i in range(0, len(content_nodes), BATCH_SIZE):
+            batch = content_nodes[i:i + BATCH_SIZE]
+            batch_text_parts = []
+            for n in batch:
+                batch_text_parts.append(
+                    f"[node_id: {n['node_id']}]\n[title: {n.get('title', '')}]\n{n['content'][:800]}"
+                )
+            batch_text = "\n\n---\n\n".join(batch_text_parts)
+
+            prompt = f"""请从以下多段文本中批量提取实体和关系，按JSON格式输出。
+
+文本批次:
+{batch_text}
+
+请按以下格式输出（为每个实体标注其来源 node_id）:
 {{
   "entities": [
-    {{"name": "实体名", "type": "概念/技术/工具/人物/组织", "description": "简短描述"}}
+    {{"name": "实体名", "type": "概念/技术/工具/人物/组织", "description": "简短描述", "node_id": "来源节点ID"}}
   ],
   "relations": [
     {{"source": "源实体名", "target": "目标实体名", "type": "包含/依赖/属于/相关/基于/实现", "description": "关系描述"}}
@@ -158,29 +190,36 @@ class KnowledgeGraphBuilder:
                 response = self.llm_func(prompt)
                 clean = response.strip()
                 if clean.startswith("```"):
-                    clean = clean.split("\n", 1)[-1].rsplit("```", 1)[0]
+                    clean = clean.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
                 parsed = json.loads(clean)
 
                 for ent_data in parsed.get("entities", []):
                     name = ent_data.get("name", "").strip()
-                    if not name:
+                    if not name or name in existing_names:
                         continue
-                    existing = self._find_entity_by_name(name)
-                    if existing:
-                        if doc_id and not existing.doc_id:
+                    src_node_id = ent_data.get("node_id", batch[0]["node_id"])
+                    existing_id = self._resolve_entity_conflict(name)
+                    if existing_id:
+                        existing = self._load_entity(existing_id)
+                        if existing and doc_id and not existing.doc_id:
                             existing.doc_id = doc_id
-                            existing.source_node_id = node_id
-                        all_entities.append(existing)
+                            existing.source_node_id = src_node_id
+                            self._save_entity(existing)
+                        if existing:
+                            all_entities.append(existing)
+                            existing_names.add(name)
                     else:
                         entity = Entity(
                             name=name,
                             entity_type=ent_data.get("type", "concept"),
                             description=ent_data.get("description", ""),
-                            source_node_id=node_id,
+                            source_node_id=src_node_id,
                             doc_id=doc_id,
                         )
                         self._save_entity(entity)
+                        self._name_to_id[name] = entity.entity_id
                         all_entities.append(entity)
+                        existing_names.add(name)
 
                 name_to_id = {e.name: e.entity_id for e in all_entities}
 
@@ -190,26 +229,21 @@ class KnowledgeGraphBuilder:
                     if not src_name or not tgt_name:
                         continue
 
-                    src_id = name_to_id.get(src_name)
-                    tgt_id = name_to_id.get(tgt_name)
-
-                    if not src_id:
-                        src_entity = Entity(name=src_name, source_node_id=node_id, doc_id=doc_id)
-                        self._save_entity(src_entity)
-                        name_to_id[src_name] = src_entity.entity_id
-                        src_id = src_entity.entity_id
-                        all_entities.append(src_entity)
-
-                    if not tgt_id:
-                        tgt_entity = Entity(name=tgt_name, source_node_id=node_id, doc_id=doc_id)
-                        self._save_entity(tgt_entity)
-                        name_to_id[tgt_name] = tgt_entity.entity_id
-                        tgt_id = tgt_entity.entity_id
-                        all_entities.append(tgt_entity)
+                    for ent_name in (src_name, tgt_name):
+                        eid = name_to_id.get(ent_name)
+                        if not eid:
+                            eid = self._resolve_entity_conflict(ent_name)
+                        if not eid:
+                            new_entity = Entity(name=ent_name, doc_id=doc_id)
+                            self._save_entity(new_entity)
+                            self._name_to_id[ent_name] = new_entity.entity_id
+                            name_to_id[ent_name] = new_entity.entity_id
+                            all_entities.append(new_entity)
+                            existing_names.add(ent_name)
 
                     relation = Relation(
-                        source_entity_id=src_id,
-                        target_entity_id=tgt_id,
+                        source_entity_id=name_to_id.get(src_name, ""),
+                        target_entity_id=name_to_id.get(tgt_name, ""),
                         relation_type=rel_data.get("type", "related_to"),
                         description=rel_data.get("description", ""),
                         doc_id=doc_id,
@@ -218,10 +252,24 @@ class KnowledgeGraphBuilder:
                     all_relations.append(relation)
 
             except (json.JSONDecodeError, Exception):
-                rule_entities, rule_relations = self._extract_with_rules(content, node_id, doc_id)
-                all_entities.extend(rule_entities)
-                all_relations.extend(rule_relations)
+                # LLM batch failed — fall back to rule-based extraction for each node
+                for node in batch:
+                    ne, nr = self._extract_with_rules(
+                        node.get("content", ""), node.get("node_id", ""), doc_id, node.get("title", "")
+                    )
+                    for e in ne:
+                        self._save_entity(e)
+                        self._name_to_id[e.name] = e.entity_id
+                        all_entities.append(e)
+                        existing_names.add(e.name)
+                    for r in nr:
+                        self._save_relation(r)
+                        all_relations.append(r)
+                continue
 
+        return self._build_result(doc_id, all_entities, all_relations)
+
+    def _build_result(self, doc_id, all_entities, all_relations):
         return {
             "doc_id": doc_id,
             "total_entities": len(all_entities),
@@ -229,6 +277,20 @@ class KnowledgeGraphBuilder:
             "entity_types": self._count_entity_types(all_entities),
             "relation_types": self._count_relation_types(all_relations),
         }
+
+    def _load_all_entities_for_doc(self, doc_id: str) -> List[Entity]:
+        cursor = self.db.execute(
+            "SELECT entity_id, name, entity_type, description, source_node_id, doc_id, properties "
+            "FROM entities WHERE doc_id = ?", (doc_id,)
+        )
+        results = []
+        for row in cursor.fetchall():
+            results.append(Entity(
+                entity_id=row[0], name=row[1], entity_type=row[2],
+                description=row[3], source_node_id=row[4], doc_id=row[5],
+                properties=json.loads(row[6]) if row[6] else {},
+            ))
+        return results
 
     def _build_with_rules(
         self,
@@ -254,6 +316,50 @@ class KnowledgeGraphBuilder:
             "entity_types": self._count_entity_types(all_entities),
             "relation_types": self._count_relation_types(all_relations),
         }
+
+    def _extract_with_ner(
+        self,
+        content: str,
+        node_id: str,
+        doc_id: str,
+        title: str = "",
+    ):
+        entities = []
+        relations = []
+        seen = set()
+
+        if title and title not in seen:
+            e = self._find_or_create_entity(title, "section", node_id, doc_id)
+            entities.append(e)
+            seen.add(title)
+
+        quoted = re.findall(r'[""「»『]([^""「»』]{2,30})[""」』]', content)
+        for name in quoted:
+            if name in seen:
+                continue
+            seen.add(name)
+            e = self._find_or_create_entity(name, "concept_term", node_id, doc_id)
+            entities.append(e)
+
+        camel_case = re.findall(r'\b[A-Z][a-z]+(?:[A-Z][a-z]+)+\b', content)
+        for name in camel_case:
+            if name in seen or len(name) < 3:
+                continue
+            seen.add(name)
+            e = self._find_or_create_entity(name, "technique", node_id, doc_id)
+            entities.append(e)
+
+        capitalized = re.findall(r'\b[A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,}){0,3}\b', content)
+        for name in capitalized:
+            if name in seen or len(name) < 3:
+                continue
+            if any(kw in name.lower() for kw in ["the", "this", "that", "these", "those", "what", "how", "why"]):
+                continue
+            seen.add(name)
+            e = self._find_or_create_entity(name, "concept", node_id, doc_id)
+            entities.append(e)
+
+        return entities, relations
 
     def _extract_with_rules(
         self,
@@ -299,19 +405,27 @@ class KnowledgeGraphBuilder:
                     self._save_relation(relation)
                     relations.append(relation)
 
-        for i in range(len(entities)):
-            for j in range(i + 1, len(entities)):
-                if entities[i].name in entities[j].description or entities[j].name in entities[i].description:
-                    relation = Relation(
-                        source_entity_id=entities[i].entity_id,
-                        target_entity_id=entities[j].entity_id,
-                        relation_type="related_to",
-                        description=f"{entities[i].name} 与 {entities[j].name} 相关",
-                        doc_id=doc_id,
-                        weight=0.5,
-                    )
-                    self._save_relation(relation)
-                    relations.append(relation)
+        name_to_entity = {e.name: e for e in entities}
+        desc_name_index = {}
+        for e in entities:
+            for other_name in name_to_entity:
+                if other_name != e.name and other_name in e.description:
+                    desc_name_index.setdefault(e.name, set()).add(other_name)
+
+        for name, related_names in desc_name_index.items():
+            entity = name_to_entity[name]
+            for related_name in related_names:
+                related_entity = name_to_entity[related_name]
+                relation = Relation(
+                    source_entity_id=entity.entity_id,
+                    target_entity_id=related_entity.entity_id,
+                    relation_type="related_to",
+                    description=f"{entity.name} 与 {related_entity.name} 相关",
+                    doc_id=doc_id,
+                    weight=0.5,
+                )
+                self._save_relation(relation)
+                relations.append(relation)
 
         return entities, relations
 
@@ -335,7 +449,7 @@ class KnowledgeGraphBuilder:
                     continue
                 visited_entities.add(eid)
 
-                cursor = self.conn.execute(
+                cursor = self.db.execute(
                     "SELECT relation_id, source_entity_id, target_entity_id, relation_type, description, weight "
                     "FROM relations WHERE source_entity_id = ? OR target_entity_id = ?",
                     (eid, eid),
@@ -385,18 +499,13 @@ class KnowledgeGraphBuilder:
         )
         return paths
 
-    def get_related_entities(
-        self,
-        entity_name: str,
-        relation_type: Optional[str] = None,
-        limit: int = 10,
-    ) -> List[Dict[str, Any]]:
+    def get_related_entities(self, entity_name: str, relation_type: Optional[str] = None, limit: int = 10) -> List[Dict[str, Any]]:
         entity = self._find_entity_by_name(entity_name)
         if not entity:
             return []
 
         if relation_type:
-            cursor = self.conn.execute(
+            cursor = self.db.execute(
                 "SELECT r.relation_type, r.description, r.weight, e.entity_id, e.name, e.entity_type, e.description "
                 "FROM relations r JOIN entities e ON "
                 "(r.target_entity_id = e.entity_id AND r.source_entity_id = ?) OR "
@@ -405,7 +514,7 @@ class KnowledgeGraphBuilder:
                 (entity.entity_id, entity.entity_id, relation_type, limit),
             )
         else:
-            cursor = self.conn.execute(
+            cursor = self.db.execute(
                 "SELECT r.relation_type, r.description, r.weight, e.entity_id, e.name, e.entity_type, e.description "
                 "FROM relations r JOIN entities e ON "
                 "(r.target_entity_id = e.entity_id AND r.source_entity_id = ?) OR "
@@ -429,13 +538,13 @@ class KnowledgeGraphBuilder:
         ]
 
     def get_graph_stats(self) -> Dict[str, Any]:
-        cursor = self.conn.execute("SELECT COUNT(*) FROM entities")
+        cursor = self.db.execute("SELECT COUNT(*) FROM entities")
         entity_count = cursor.fetchone()[0]
-        cursor = self.conn.execute("SELECT COUNT(*) FROM relations")
+        cursor = self.db.execute("SELECT COUNT(*) FROM relations")
         relation_count = cursor.fetchone()[0]
-        cursor = self.conn.execute("SELECT entity_type, COUNT(*) FROM entities GROUP BY entity_type")
+        cursor = self.db.execute("SELECT entity_type, COUNT(*) FROM entities GROUP BY entity_type")
         entity_types = dict(cursor.fetchall())
-        cursor = self.conn.execute("SELECT relation_type, COUNT(*) FROM relations GROUP BY relation_type")
+        cursor = self.db.execute("SELECT relation_type, COUNT(*) FROM relations GROUP BY relation_type")
         relation_types = dict(cursor.fetchall())
         return {
             "total_entities": entity_count,
@@ -477,7 +586,7 @@ class KnowledgeGraphBuilder:
                 continue
             visited.add(current_id)
 
-            cursor = self.conn.execute(
+            cursor = self.db.execute(
                 "SELECT relation_id, source_entity_id, target_entity_id, relation_type "
                 "FROM relations WHERE source_entity_id = ? OR target_entity_id = ?",
                 (current_id, current_id),
@@ -494,28 +603,74 @@ class KnowledgeGraphBuilder:
 
         return sorted(paths, key=lambda p: p["hops"])
 
+    def get_related_entities_by_id(self, entity_id: str, relation_type: Optional[str] = None, limit: int = 10) -> List[Dict[str, Any]]:
+        if relation_type:
+            cursor = self.db.execute(
+                "SELECT r.relation_type, r.description, r.weight, e.entity_id, e.name, e.entity_type, 'source' as direction "
+                "FROM relations r JOIN entities e ON r.target_entity_id = e.entity_id "
+                "WHERE r.source_entity_id = ? AND r.relation_type = ? "
+                "UNION "
+                "SELECT r.relation_type, r.description, r.weight, e.entity_id, e.name, e.entity_type, 'target' as direction "
+                "FROM relations r JOIN entities e ON r.source_entity_id = e.entity_id "
+                "WHERE r.target_entity_id = ? AND r.relation_type = ? "
+                "LIMIT ?",
+                (entity_id, relation_type, entity_id, relation_type, limit),
+            )
+        else:
+            cursor = self.db.execute(
+                "SELECT r.relation_type, r.description, r.weight, e.entity_id, e.name, e.entity_type, 'source' as direction "
+                "FROM relations r JOIN entities e ON r.target_entity_id = e.entity_id "
+                "WHERE r.source_entity_id = ? "
+                "UNION "
+                "SELECT r.relation_type, r.description, r.weight, e.entity_id, e.name, e.entity_type, 'target' as direction "
+                "FROM relations r JOIN entities e ON r.source_entity_id = e.entity_id "
+                "WHERE r.target_entity_id = ? "
+                "LIMIT ?",
+                (entity_id, entity_id, limit),
+            )
+        return [
+            {
+                "relation_type": row[0],
+                "description": row[1],
+                "weight": row[2],
+                "entity_id": row[3],
+                "name": row[4],
+                "entity_type": row[5],
+                "direction": row[6] if len(row) > 6 else "",
+            }
+            for row in cursor.fetchall()
+        ]
+
     def _find_or_create_entity(
         self,
         name: str,
         entity_type: str,
         node_id: str,
         doc_id: str,
+        properties: Optional[Dict[str, Any]] = None,
     ) -> Entity:
-        existing = self._find_entity_by_name(name)
-        if existing:
-            return existing
+        existing_id = self._resolve_entity_conflict(name)
+        if existing_id:
+            existing = self._load_entity(existing_id)
+            if existing:
+                if properties:
+                    existing.properties.update(properties)
+                    self._save_entity(existing)
+                return existing
 
         entity = Entity(
             name=name,
             entity_type=entity_type,
             source_node_id=node_id,
             doc_id=doc_id,
+            properties=properties or {},
         )
         self._save_entity(entity)
+        self._name_to_id[name] = entity.entity_id
         return entity
 
     def _find_entity_by_name(self, name: str) -> Optional[Entity]:
-        cursor = self.conn.execute(
+        cursor = self.db.execute(
             "SELECT entity_id, name, entity_type, description, source_node_id, doc_id, properties "
             "FROM entities WHERE name = ? LIMIT 1",
             (name,),
@@ -534,29 +689,38 @@ class KnowledgeGraphBuilder:
         )
 
     def search_entities(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
-        cursor = self.conn.execute(
-            "SELECT entity_id, name, entity_type, description FROM entities"
+        safe = escape_like(query)
+        like = self.db.execute(
+            "SELECT entity_id, name, entity_type, description FROM entities WHERE name LIKE ? ESCAPE '\\' LIMIT ?",
+            (f"%{safe}%", limit * 2),
         )
-        all_entities = [{"entity_id": r[0], "name": r[1], "entity_type": r[2], "description": r[3]} for r in cursor.fetchall()]
+        results = [{"entity_id": r[0], "name": r[1], "entity_type": r[2], "description": r[3]} for r in like.fetchall()]
+        if results:
+            return results[:limit]
 
-        exact = [e for e in all_entities if query.lower() in e["name"].lower()]
-        if exact:
-            return exact[:limit]
+        like_desc = self.db.execute(
+            "SELECT entity_id, name, entity_type, description FROM entities WHERE description LIKE ? ESCAPE '\\' LIMIT ?",
+            (f"%{safe}%", limit),
+        )
+        results = [{"entity_id": r[0], "name": r[1], "entity_type": r[2], "description": r[3]} for r in like_desc.fetchall()]
+        if results:
+            return results[:limit]
 
-        names = [e["name"] for e in all_entities]
+        import difflib
+        all_names = self.db.execute("SELECT name FROM entities").fetchall()
+        names = [r[0] for r in all_names]
         close = difflib.get_close_matches(query, names, n=limit, cutoff=0.3)
         if close:
-            matched_names = set(close)
-            return [e for e in all_entities if e["name"] in matched_names][:limit]
-
-        like = self.conn.execute(
-            "SELECT entity_id, name, entity_type, description FROM entities WHERE name LIKE ? OR description LIKE ? LIMIT ?",
-            (f"%{query}%", f"%{query}%", limit),
-        )
-        return [{"entity_id": r[0], "name": r[1], "entity_type": r[2], "description": r[3]} for r in like.fetchall()]
+            matched = set(close)
+            rows = self.db.execute(
+                f"SELECT entity_id, name, entity_type, description FROM entities WHERE name IN ({','.join('?' for _ in close)})",
+                list(close),
+            ).fetchall()
+            return [{"entity_id": r[0], "name": r[1], "entity_type": r[2], "description": r[3]} for r in rows]
+        return []
 
     def _load_entity(self, entity_id: str) -> Optional[Entity]:
-        cursor = self.conn.execute(
+        cursor = self.db.execute(
             "SELECT entity_id, name, entity_type, description, source_node_id, doc_id, properties "
             "FROM entities WHERE entity_id = ?",
             (entity_id,),
@@ -575,7 +739,7 @@ class KnowledgeGraphBuilder:
         )
 
     def _load_relation(self, relation_id: str) -> Optional[Relation]:
-        cursor = self.conn.execute(
+        cursor = self.db.execute(
             "SELECT relation_id, source_entity_id, target_entity_id, relation_type, description, weight, doc_id "
             "FROM relations WHERE relation_id = ?",
             (relation_id,),
@@ -594,7 +758,7 @@ class KnowledgeGraphBuilder:
         )
 
     def _save_entity(self, entity: Entity):
-        self.conn.execute(
+        self.db.execute(
             """INSERT OR REPLACE INTO entities
             (entity_id, name, entity_type, description, source_node_id, doc_id, properties)
             VALUES (?, ?, ?, ?, ?, ?, ?)""",
@@ -608,10 +772,10 @@ class KnowledgeGraphBuilder:
                 json.dumps(entity.properties, ensure_ascii=False),
             ),
         )
-        self.conn.commit()
+        self.db.commit()
 
     def _save_relation(self, relation: Relation):
-        self.conn.execute(
+        self.db.execute(
             """INSERT OR REPLACE INTO relations
             (relation_id, source_entity_id, target_entity_id, relation_type, description, weight, doc_id)
             VALUES (?, ?, ?, ?, ?, ?, ?)""",
@@ -625,7 +789,7 @@ class KnowledgeGraphBuilder:
                 relation.doc_id,
             ),
         )
-        self.conn.commit()
+        self.db.commit()
 
     def _count_entity_types(self, entities: List[Entity]) -> Dict[str, int]:
         counts = defaultdict(int)
@@ -640,4 +804,80 @@ class KnowledgeGraphBuilder:
         return dict(counts)
 
     def close(self):
-        self.conn.close()
+        pass  # DatabaseManager is shared, closed at app shutdown
+
+    def _load_name_index(self):
+        cursor = self.db.execute("SELECT entity_id, name FROM entities")
+        for row in cursor.fetchall():
+            self._name_to_id[row[1]] = row[0]
+
+    def _resolve_entity_conflict(self, name: str) -> Optional[str]:
+        exact = self._find_entity_by_name(name)
+        if exact:
+            return exact.entity_id
+
+        alias_target = self._alias_map.get(name)
+        if alias_target and alias_target in self._name_to_id:
+            return self._name_to_id[alias_target]
+
+        candidates = self.db.execute(
+            "SELECT entity_id, name FROM entities ORDER BY length(name) ASC LIMIT 20"
+        ).fetchall()
+
+        # Phase 1: vector similarity (fast, batch)
+        if self.embed_func:
+            candidate_names = [cname for _, cname in candidates]
+            try:
+                all_texts = [name] + candidate_names
+                vecs = self.embed_func(all_texts)
+                if not vecs or len(vecs) == 0:
+                    return self._llm_match(name, candidates, context_hints)
+                name_vec = vecs[0]
+                scored = []
+                for i, (cid, cname) in enumerate(candidates):
+                    sim = sum(a * b for a, b in zip(name_vec, vecs[i + 1])) / (
+                        (sum(a * a for a in name_vec) ** 0.5) * (sum(b * b for b in vecs[i + 1]) ** 0.5) + 1e-10
+                    )
+                    scored.append((sim, cid, cname))
+                scored.sort(key=lambda x: -x[0])
+                best_sim, best_cid, best_cname = scored[0]
+                if best_sim > 0.88:
+                    self._alias_map[name] = best_cname
+                    return best_cid
+                # Borderline: top-3 with LLM judge with context
+                if self.llm_func:
+                    for sim, cid, cname in scored[:3]:
+                        if sim > 0.72:
+                            try:
+                                if self._llm_judge_same_concept(name, cname):
+                                    self._alias_map[name] = cname
+                                    return cid
+                            except Exception:
+                                continue
+                return None
+            except Exception as e:
+                logger.debug(f"Embedding-based entity matching failed: {e}")
+
+        # Phase 2: substring + LLM fallback (only when embed_func unavailable)
+        if self.llm_func:
+            for cid, cname in candidates:
+                if len(cname) < 2 or len(name) < 2:
+                    continue
+                if cname.lower() in name.lower() or name.lower() in cname.lower():
+                    try:
+                        if self._llm_judge_same_concept(name, cname):
+                            self._alias_map[name] = cname
+                            return cid
+                    except Exception:
+                        continue
+        return None
+
+    def _llm_judge_same_concept(self, name_a: str, name_b: str) -> bool:
+        if not self.llm_func:
+            return False
+        prompt = f"""请判断以下两个名称是否指代同一个概念/事物。
+只需回答"是"或"否"，不要其他内容。
+名称1: {name_a}
+名称2: {name_b}"""
+        response = self.llm_func(prompt).strip().lower()
+        return "是" in response or "yes" in response

@@ -55,11 +55,19 @@ def test_knowledge_graph():
         assert len(relations["relations"]) > 0
         print(f"[PASS] get_entity_relations: {len(relations['relations'])} relations")
 
-        kg.close()
+        kg.db.close()
         print("[PASS] KnowledgeGraphBuilder all tests passed")
     finally:
         if os.path.exists(db_path):
-            os.unlink(db_path)
+            try:
+                os.unlink(db_path)
+            except PermissionError:
+                for suffix in ("-shm", "-wal"):
+                    p = db_path + suffix
+                    if os.path.exists(p):
+                        try: os.unlink(p)
+                        except Exception: pass
+                os.unlink(db_path)
 
 
 def test_query_classifier():
@@ -212,18 +220,20 @@ Deep learning uses multi-layer neural networks. Backpropagation is the core trai
 
         ask_result = pipeline.ask("What is statistics?", session_id=sid, doc_id="ds_handbook")
         assert "answer" in ask_result
-        assert "query_type" in ask_result
-        assert "confidence" in ask_result
+        assert "intent" in ask_result
+        assert "intent_confidence" in ask_result
         assert "sources" in ask_result
-        print(f"[PASS] ask: type={ask_result['query_type']}, confidence={ask_result['confidence']:.2f}")
+        print(f"[PASS] ask: type={ask_result['intent']}, confidence={ask_result['intent_confidence']:.2f}")
 
         ask_result2 = pipeline.ask("How to process data?", session_id=sid, doc_id="ds_handbook")
         assert "answer" in ask_result2
-        print(f"[PASS] ask (follow-up): type={ask_result2['query_type']}")
+        print(f"[PASS] ask (follow-up): type={ask_result2['intent']}")
 
         kg_entity = pipeline.query_knowledge_graph("Statistics")
         if kg_entity:
-            print(f"[PASS] query_knowledge_graph: found entity '{kg_entity['name']}'")
+            entity = kg_entity.get("entity", kg_entity)
+            name = entity.get("name", entity.get("entity_name", "?"))
+            print(f"[PASS] query_knowledge_graph: found entity '{name}'")
         else:
             print("[PASS] query_knowledge_graph: no entity found (rule-based extraction limited)")
 

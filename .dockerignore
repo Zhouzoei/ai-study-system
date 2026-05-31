@@ -1,0 +1,50 @@
+# Environment — 禁止将真实密钥打入镜像
+.env
+.env.local
+*.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Database
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Git
+.git/
+.gitignore
+
+# Logs
+*.log
+
+# Test
+.pytest_cache/
+tests/
+
+# Docs
+docs/
+
+# User data
+user_data/
+
+# Default .env.example (placeholder, not a risk but no need in image)
+.env.example

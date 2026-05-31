@@ -98,20 +98,26 @@ class LearningAnalytics:
         if not docs:
             storage_stats = self.tree_storage.get_stats()
             if storage_stats.get("doc_count", 0) > 0:
-                cursor = self.tree_storage.conn.execute(
+                cursor = self.tree_storage.db.execute(
                     "SELECT DISTINCT doc_id FROM tree_nodes WHERE level = 3"
                 )
                 docs = [row[0] for row in cursor.fetchall()]
+
+        # Batch query all exposed node IDs for the user to avoid N+1 queries
+        exposed_node_ids = set()
+        cursor = self.progress_tracker.db.execute(
+            "SELECT knowledge_node_id FROM knowledge_records "
+            "WHERE user_id = ? AND exposure_count > 0",
+            (user_id,),
+        )
+        for row in cursor.fetchall():
+            exposed_node_ids.add(row[0])
 
         result = []
         for doc_id in docs:
             l3_nodes = self.tree_storage.get_nodes_by_level(3, doc_id)
             total = len(l3_nodes)
-            covered = 0
-            for node in l3_nodes:
-                record = self.progress_tracker._find_record(node.node_id, user_id)
-                if record and record.exposure_count > 0:
-                    covered += 1
+            covered = sum(1 for node in l3_nodes if node.node_id in exposed_node_ids)
 
             result.append({
                 "doc_id": doc_id,
@@ -130,7 +136,7 @@ class LearningAnalytics:
         forgotten_areas = []
         never_reviewed = []
 
-        cursor = self.progress_tracker.conn.execute(
+        cursor = self.progress_tracker.db.execute(
             "SELECT knowledge_node_id, title, mastery, exposure_count, "
             "last_reviewed_at, next_review_at, review_interval_days, ease_factor "
             "FROM knowledge_records WHERE user_id = ?",
@@ -186,7 +192,7 @@ class LearningAnalytics:
         if not self.progress_tracker:
             return {}
 
-        cursor = self.progress_tracker.conn.execute(
+        cursor = self.progress_tracker.db.execute(
             "SELECT knowledge_node_id, exposure_count, last_reviewed_at, created_at "
             "FROM knowledge_records WHERE user_id = ? AND exposure_count > 0",
             (user_id,),
@@ -246,7 +252,7 @@ class LearningAnalytics:
         if not self.progress_tracker:
             return 0
 
-        cursor = self.progress_tracker.conn.execute(
+        cursor = self.progress_tracker.db.execute(
             "SELECT DISTINCT date(last_reviewed_at, 'unixepoch') as study_date "
             "FROM knowledge_records WHERE user_id = ? AND last_reviewed_at > 0 "
             "ORDER BY study_date DESC",
@@ -299,7 +305,7 @@ class LearningAnalytics:
         if not self.progress_tracker:
             return []
 
-        cursor = self.progress_tracker.conn.execute(
+        cursor = self.progress_tracker.db.execute(
             "SELECT date(timestamp, 'unixepoch') as review_date, "
             "old_mastery, new_mastery, quality "
             "FROM review_events WHERE user_id = ? "
@@ -331,6 +337,42 @@ class LearningAnalytics:
             })
 
         return timeline[-30:]
+
+    def get_confusion_patterns(self, user_id: str = "default") -> List[Dict[str, Any]]:
+        if not self.progress_tracker:
+            return []
+        wrong_items = self.progress_tracker.get_wrong_answers(user_id, limit=100)
+        if len(wrong_items) < 2:
+            return []
+
+        for item in wrong_items:
+            q = item.get("question", "").lower()
+            ca = item.get("correct_answer", "").lower()
+            ua = item.get("user_answer", "").lower()
+            item["_q_norm"] = q
+            item["_ca_norm"] = ca
+            item["_ua_norm"] = ua
+
+        pairs = []
+        seen_pairs = set()
+        for i in range(len(wrong_items)):
+            for j in range(i + 1, len(wrong_items)):
+                a = wrong_items[i]
+                b = wrong_items[j]
+                if a["_ca_norm"] == b["_ua_norm"] and b["_ca_norm"] == a["_ua_norm"]:
+                    pair_key = tuple(sorted([a["_ca_norm"], b["_ca_norm"]]))
+                    if pair_key not in seen_pairs:
+                        seen_pairs.add(pair_key)
+                        pairs.append({
+                            "concept_a": a.get("correct_answer", ""),
+                            "concept_b": b.get("correct_answer", ""),
+                            "user_wrong_answer_a": a.get("user_answer", ""),
+                            "user_wrong_answer_b": b.get("user_answer", ""),
+                            "count": 2,
+                            "node_ids_a": a.get("knowledge_node_ids", []),
+                            "node_ids_b": b.get("knowledge_node_ids", []),
+                        })
+        return pairs
 
     def get_study_recommendations(self, user_id: str = "default") -> List[Dict[str, Any]]:
         recommendations = []
@@ -389,7 +431,7 @@ class LearningAnalytics:
 
         kg_stats = self.knowledge_graph.get_graph_stats()
 
-        cursor = self.knowledge_graph.conn.execute(
+        cursor = self.knowledge_graph.db.execute(
             "SELECT e.name, e.entity_type, COUNT(r.relation_id) as rel_count "
             "FROM entities e LEFT JOIN relations r ON "
             "(r.source_entity_id = e.entity_id OR r.target_entity_id = e.entity_id) "
@@ -400,7 +442,7 @@ class LearningAnalytics:
             for row in cursor.fetchall()
         ]
 
-        cursor = self.knowledge_graph.conn.execute(
+        cursor = self.knowledge_graph.db.execute(
             "SELECT e.name, e.entity_type FROM entities e "
             "LEFT JOIN relations r ON "
             "(r.source_entity_id = e.entity_id OR r.target_entity_id = e.entity_id) "

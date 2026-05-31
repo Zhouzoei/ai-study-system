@@ -1,8 +1,12 @@
-gradio>=4.0
+streamlit>=1.35
 python-dotenv>=1.0
 openai>=1.0
 dashscope>=1.0
 qdrant-client>=1.0
-pypdf>=3.0
 plotly>=5.0
 jieba>=0.42
+sentence-transformers>=2.2
+tavily>=0.3
+httpx>=0.24
+requests>=2.28
+pytest>=7.0

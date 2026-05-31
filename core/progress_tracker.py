@@ -1,5 +1,4 @@
 import json
-import sqlite3
 import time
 import math
 import uuid
@@ -7,7 +6,7 @@ from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, field
 from enum import Enum
 
-from config import config
+from core.database import DatabaseManager, get_database
 
 
 class MasteryLevel(str, Enum):
@@ -80,15 +79,20 @@ class ReviewEvent:
 class ProgressTracker:
     def __init__(
         self,
-        db_path: Optional[str] = None,
+        db: Optional[DatabaseManager] = None,
+        db_path: Optional[str] = None,  # deprecated, kept for backward compat
     ):
-        self.db_path = db_path or config.HIERARCHICAL_TREE_DB.replace("tree_store", "progress")
+        if db is not None:
+            self.db = db
+        elif db_path is not None:
+            self.db = get_database(db_path)
+        else:
+            self.db = get_database()
         self._init_db()
 
     def _init_db(self):
-        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("""
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("""
             CREATE TABLE IF NOT EXISTS knowledge_records (
                 record_id TEXT PRIMARY KEY,
                 user_id TEXT NOT NULL DEFAULT 'default',
@@ -104,7 +108,7 @@ class ProgressTracker:
                 metadata TEXT NOT NULL DEFAULT '{}'
             )
         """)
-        self.conn.execute("""
+        self.db.execute("""
             CREATE TABLE IF NOT EXISTS review_events (
                 event_id TEXT PRIMARY KEY,
                 record_id TEXT NOT NULL,
@@ -117,19 +121,32 @@ class ProgressTracker:
                 timestamp REAL NOT NULL DEFAULT 0
             )
         """)
-        self.conn.execute("""
+        self.db.execute("""
             CREATE INDEX IF NOT EXISTS idx_kr_user ON knowledge_records(user_id)
         """)
-        self.conn.execute("""
+        self.db.execute("""
             CREATE INDEX IF NOT EXISTS idx_kr_node ON knowledge_records(knowledge_node_id)
         """)
-        self.conn.execute("""
+        self.db.execute("""
             CREATE INDEX IF NOT EXISTS idx_kr_next_review ON knowledge_records(next_review_at)
         """)
-        self.conn.execute("""
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS wrong_answers (
+                wa_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL DEFAULT 'default',
+                question TEXT NOT NULL,
+                user_answer TEXT NOT NULL,
+                correct_answer TEXT NOT NULL,
+                knowledge_node_ids TEXT NOT NULL DEFAULT '[]',
+                wrong_count INTEGER NOT NULL DEFAULT 1,
+                last_wrong_at REAL NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL DEFAULT 0
+            )
+        """)
+        self.db.execute("""
             CREATE INDEX IF NOT EXISTS idx_rev_record ON review_events(record_id)
         """)
-        self.conn.commit()
+        self.db.commit()
 
     def record_exposure(
         self,
@@ -207,7 +224,7 @@ class ProgressTracker:
         limit: int = 10,
     ) -> List[Dict[str, Any]]:
         now = time.time()
-        cursor = self.conn.execute(
+        cursor = self.db.execute(
             "SELECT record_id, knowledge_node_id, title, mastery, "
             "last_reviewed_at, next_review_at, review_interval_days, exposure_count "
             "FROM knowledge_records "
@@ -239,7 +256,7 @@ class ProgressTracker:
     ) -> List[Dict[str, Any]]:
         now = time.time()
         future = now + days_ahead * 86400
-        cursor = self.conn.execute(
+        cursor = self.db.execute(
             "SELECT record_id, knowledge_node_id, title, mastery, next_review_at, review_interval_days "
             "FROM knowledge_records "
             "WHERE user_id = ? AND next_review_at > ? AND next_review_at <= ? "
@@ -261,19 +278,19 @@ class ProgressTracker:
         ]
 
     def get_progress_summary(self, user_id: str = "default") -> Dict[str, Any]:
-        cursor = self.conn.execute(
+        cursor = self.db.execute(
             "SELECT mastery, COUNT(*) FROM knowledge_records WHERE user_id = ? GROUP BY mastery",
             (user_id,),
         )
         mastery_counts = {row[0]: row[1] for row in cursor.fetchall()}
 
-        cursor = self.conn.execute(
+        cursor = self.db.execute(
             "SELECT COUNT(*) FROM knowledge_records WHERE user_id = ? AND next_review_at <= ?",
             (user_id, time.time()),
         )
         due_count = cursor.fetchone()[0]
 
-        cursor = self.conn.execute(
+        cursor = self.db.execute(
             "SELECT COUNT(*), SUM(exposure_count), AVG(ease_factor) "
             "FROM knowledge_records WHERE user_id = ?",
             (user_id,),
@@ -310,7 +327,7 @@ class ProgressTracker:
         if not record:
             return []
 
-        cursor = self.conn.execute(
+        cursor = self.db.execute(
             "SELECT quality, old_mastery, new_mastery, old_interval, new_interval, timestamp "
             "FROM review_events WHERE record_id = ? ORDER BY timestamp DESC LIMIT ?",
             (record.record_id, limit),
@@ -353,7 +370,6 @@ class ProgressTracker:
                 record.review_interval_days = record.review_interval_days * record.ease_factor
         else:
             record.review_interval_days = 1.0
-            record.exposure_count = 0
 
         record.ease_factor = max(1.3, record.ease_factor + 0.1 - (5 - quality) * (0.08 + (5 - quality) * 0.02))
 
@@ -378,7 +394,7 @@ class ProgressTracker:
             record.mastery = mastery_order[current_idx - 1]
 
     def _find_record(self, knowledge_node_id: str, user_id: str) -> Optional[KnowledgeRecord]:
-        cursor = self.conn.execute(
+        cursor = self.db.execute(
             "SELECT record_id, user_id, knowledge_node_id, title, mastery, "
             "exposure_count, last_reviewed_at, next_review_at, review_interval_days, "
             "ease_factor, created_at, metadata "
@@ -405,7 +421,7 @@ class ProgressTracker:
         )
 
     def _save_record(self, record: KnowledgeRecord):
-        self.conn.execute(
+        self.db.execute(
             """INSERT OR REPLACE INTO knowledge_records
             (record_id, user_id, knowledge_node_id, title, mastery, exposure_count,
              last_reviewed_at, next_review_at, review_interval_days, ease_factor, created_at, metadata)
@@ -425,10 +441,10 @@ class ProgressTracker:
                 json.dumps(record.metadata, ensure_ascii=False),
             ),
         )
-        self.conn.commit()
+        self.db.commit()
 
     def _save_event(self, event: ReviewEvent):
-        self.conn.execute(
+        self.db.execute(
             """INSERT INTO review_events
             (event_id, record_id, user_id, quality, old_mastery, new_mastery, old_interval, new_interval, timestamp)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -444,7 +460,91 @@ class ProgressTracker:
                 event.timestamp,
             ),
         )
-        self.conn.commit()
+        self.db.commit()
+
+    def record_wrong_answer(
+        self,
+        question: str,
+        user_answer: str,
+        correct_answer: str,
+        knowledge_node_ids: Optional[List[str]] = None,
+        user_id: str = "default",
+    ) -> Dict[str, Any]:
+        existing = self.db.execute(
+            "SELECT wa_id, wrong_count FROM wrong_answers "
+            "WHERE user_id = ? AND question = ? AND user_answer = ?",
+            (user_id, question, user_answer),
+        ).fetchone()
+
+        if existing:
+            new_count = existing[1] + 1
+            self.db.execute(
+                "UPDATE wrong_answers SET wrong_count = ?, last_wrong_at = ? WHERE wa_id = ?",
+                (new_count, time.time(), existing[0]),
+            )
+            self.db.commit()
+            return {"wa_id": existing[0], "wrong_count": new_count, "is_new": False}
+        else:
+            wa_id = f"wa_{uuid.uuid4().hex[:12]}"
+            now = time.time()
+            self.db.execute(
+                "INSERT INTO wrong_answers (wa_id, user_id, question, user_answer, correct_answer, knowledge_node_ids, wrong_count, last_wrong_at, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)",
+                (wa_id, user_id, question, user_answer, correct_answer,
+                 json.dumps(knowledge_node_ids or [], ensure_ascii=False), now, now),
+            )
+            self.db.commit()
+            return {"wa_id": wa_id, "wrong_count": 1, "is_new": True}
+
+    def get_wrong_answers(
+        self,
+        user_id: str = "default",
+        limit: int = 20,
+        min_wrong_count: int = 1,
+    ) -> List[Dict[str, Any]]:
+        cursor = self.db.execute(
+            "SELECT wa_id, question, user_answer, correct_answer, knowledge_node_ids, wrong_count, last_wrong_at, created_at "
+            "FROM wrong_answers WHERE user_id = ? AND wrong_count >= ? "
+            "ORDER BY wrong_count DESC, last_wrong_at DESC LIMIT ?",
+            (user_id, min_wrong_count, limit),
+        )
+        return [
+            {
+                "wa_id": row[0],
+                "question": row[1],
+                "user_answer": row[2],
+                "correct_answer": row[3],
+                "knowledge_node_ids": json.loads(row[4]) if row[4] else [],
+                "wrong_count": row[5],
+                "last_wrong_at": row[6],
+                "created_at": row[7],
+            }
+            for row in cursor.fetchall()
+        ]
+
+    def get_weak_nodes(
+        self,
+        user_id: str = "default",
+        threshold: int = 2,
+    ) -> List[Dict[str, Any]]:
+        wrong_items = self.get_wrong_answers(user_id, limit=100)
+        node_wrong_count: Dict[str, int] = {}
+        for item in wrong_items:
+            for nid in item.get("knowledge_node_ids", []):
+                node_wrong_count[nid] = node_wrong_count.get(nid, 0) + 1
+
+        weak = []
+        for nid, count in node_wrong_count.items():
+            if count >= threshold:
+                record = self._find_record(nid, user_id)
+                weak.append({
+                    "knowledge_node_id": nid,
+                    "title": record.title if record else nid,
+                    "wrong_count": count,
+                    "mastery": record.mastery.value if record else "unknown",
+                })
+        weak.sort(key=lambda x: x["wrong_count"], reverse=True)
+        return weak
 
     def close(self):
-        self.conn.close()
+        pass  # DatabaseManager is shared, closed at app shutdown

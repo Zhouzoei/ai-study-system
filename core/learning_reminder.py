@@ -1,12 +1,11 @@
 import json
-import sqlite3
 import time
 import uuid
 from typing import List, Dict, Any, Optional, Callable
 from dataclasses import dataclass, field
 from enum import Enum
 
-from config import config
+from core.database import DatabaseManager, get_database
 
 
 class ReminderType(str, Enum):
@@ -71,21 +70,26 @@ class Reminder:
 class LearningReminder:
     def __init__(
         self,
-        db_path: Optional[str] = None,
+        db: Optional[DatabaseManager] = None,
         progress_tracker=None,
         learning_planner=None,
         llm_func: Optional[Callable] = None,
+        db_path: Optional[str] = None,
     ):
-        self.db_path = db_path or config.HIERARCHICAL_TREE_DB.replace("tree_store", "reminder")
+        if db is not None:
+            self.db = db
+        elif db_path is not None:
+            self.db = get_database(db_path)
+        else:
+            self.db = get_database()
         self.progress_tracker = progress_tracker
         self.learning_planner = learning_planner
         self.llm_func = llm_func
         self._init_db()
 
     def _init_db(self):
-        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("""
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("""
             CREATE TABLE IF NOT EXISTS reminders (
                 reminder_id TEXT PRIMARY KEY,
                 user_id TEXT NOT NULL DEFAULT 'default',
@@ -103,7 +107,7 @@ class LearningReminder:
                 metadata TEXT NOT NULL DEFAULT '{}'
             )
         """)
-        self.conn.execute("""
+        self.db.execute("""
             CREATE TABLE IF NOT EXISTS reminder_preferences (
                 user_id TEXT PRIMARY KEY,
                 daily_study_time TEXT NOT NULL DEFAULT '09:00',
@@ -115,16 +119,16 @@ class LearningReminder:
                 metadata TEXT NOT NULL DEFAULT '{}'
             )
         """)
-        self.conn.execute("""
+        self.db.execute("""
             CREATE INDEX IF NOT EXISTS idx_rem_user ON reminders(user_id)
         """)
-        self.conn.execute("""
+        self.db.execute("""
             CREATE INDEX IF NOT EXISTS idx_rem_status ON reminders(status)
         """)
-        self.conn.execute("""
+        self.db.execute("""
             CREATE INDEX IF NOT EXISTS idx_rem_trigger ON reminders(trigger_at)
         """)
-        self.conn.commit()
+        self.db.commit()
 
     def create_review_reminder(
         self,
@@ -242,7 +246,7 @@ class LearningReminder:
         limit: int = 10,
     ) -> List[Dict[str, Any]]:
         now = time.time()
-        cursor = self.conn.execute(
+        cursor = self.db.execute(
             "SELECT reminder_id, user_id, reminder_type, title, message, status, "
             "trigger_at, snooze_until, reference_id, reference_type, priority, "
             "created_at, sent_at, metadata "
@@ -261,7 +265,7 @@ class LearningReminder:
     ) -> List[Dict[str, Any]]:
         now = time.time()
         future = now + hours_ahead * 3600
-        cursor = self.conn.execute(
+        cursor = self.db.execute(
             "SELECT reminder_id, user_id, reminder_type, title, message, status, "
             "trigger_at, snooze_until, reference_id, reference_type, priority, "
             "created_at, sent_at, metadata "
@@ -273,38 +277,38 @@ class LearningReminder:
         return [self._row_to_dict(row) for row in cursor.fetchall()]
 
     def mark_sent(self, reminder_id: str) -> bool:
-        self.conn.execute(
+        self.db.execute(
             "UPDATE reminders SET status = 'sent', sent_at = ? WHERE reminder_id = ?",
             (time.time(), reminder_id),
         )
-        self.conn.commit()
+        self.db.commit()
         return True
 
     def snooze(self, reminder_id: str, duration_minutes: int = 30) -> bool:
         snooze_until = time.time() + duration_minutes * 60
-        self.conn.execute(
+        self.db.execute(
             "UPDATE reminders SET status = 'snoozed', snooze_until = ? WHERE reminder_id = ?",
             (snooze_until, reminder_id),
         )
-        self.conn.commit()
+        self.db.commit()
         return True
 
     def dismiss(self, reminder_id: str) -> bool:
-        self.conn.execute(
+        self.db.execute(
             "UPDATE reminders SET status = 'dismissed' WHERE reminder_id = ?",
             (reminder_id,),
         )
-        self.conn.commit()
+        self.db.commit()
         return True
 
     def process_snoozed(self, user_id: str = "default") -> int:
         now = time.time()
-        cursor = self.conn.execute(
+        cursor = self.db.execute(
             "UPDATE reminders SET status = 'pending' "
             "WHERE user_id = ? AND status = 'snoozed' AND snooze_until <= ?",
             (user_id, now),
         )
-        self.conn.commit()
+        self.db.commit()
         return cursor.rowcount
 
     def auto_generate_reminders(self, user_id: str = "default") -> List[Reminder]:
@@ -346,7 +350,7 @@ class LearningReminder:
         return reminders
 
     def get_preferences(self, user_id: str = "default") -> Dict[str, Any]:
-        cursor = self.conn.execute(
+        cursor = self.db.execute(
             "SELECT daily_study_time, review_time, reminder_enabled, "
             "snooze_duration_minutes, max_daily_reminders, streak_threshold, metadata "
             "FROM reminder_preferences WHERE user_id = ?",
@@ -369,7 +373,7 @@ class LearningReminder:
     def update_preferences(self, user_id: str = "default", **kwargs) -> Dict[str, Any]:
         current = self.get_preferences(user_id)
         current.update(kwargs)
-        self.conn.execute(
+        self.db.execute(
             """INSERT OR REPLACE INTO reminder_preferences
             (user_id, daily_study_time, review_time, reminder_enabled,
              snooze_duration_minutes, max_daily_reminders, streak_threshold, metadata)
@@ -385,17 +389,17 @@ class LearningReminder:
                 json.dumps(current.get("metadata", {}), ensure_ascii=False),
             ),
         )
-        self.conn.commit()
+        self.db.commit()
         return current
 
     def get_reminder_stats(self, user_id: str = "default") -> Dict[str, Any]:
-        cursor = self.conn.execute(
+        cursor = self.db.execute(
             "SELECT status, COUNT(*) FROM reminders WHERE user_id = ? GROUP BY status",
             (user_id,),
         )
         status_counts = {row[0]: row[1] for row in cursor.fetchall()}
 
-        cursor = self.conn.execute(
+        cursor = self.db.execute(
             "SELECT reminder_type, COUNT(*) FROM reminders WHERE user_id = ? AND status = 'pending' GROUP BY reminder_type",
             (user_id,),
         )
@@ -451,7 +455,7 @@ class LearningReminder:
     def _find_reminder_by_reference(
         self, reference_id: str, reference_type: str, user_id: str
     ) -> Optional[Dict]:
-        cursor = self.conn.execute(
+        cursor = self.db.execute(
             "SELECT reminder_id FROM reminders "
             "WHERE reference_id = ? AND reference_type = ? AND user_id = ? AND status = 'pending'",
             (reference_id, reference_type, user_id),
@@ -471,7 +475,7 @@ class LearningReminder:
         }
 
     def _save_reminder(self, reminder: Reminder):
-        self.conn.execute(
+        self.db.execute(
             """INSERT OR REPLACE INTO reminders
             (reminder_id, user_id, reminder_type, title, message, status,
              trigger_at, snooze_until, reference_id, reference_type, priority,
@@ -494,7 +498,7 @@ class LearningReminder:
                 json.dumps(reminder.metadata, ensure_ascii=False),
             ),
         )
-        self.conn.commit()
+        self.db.commit()
 
     def _row_to_dict(self, row) -> Dict[str, Any]:
         return {
@@ -515,4 +519,4 @@ class LearningReminder:
         }
 
     def close(self):
-        self.conn.close()
+        pass  # DatabaseManager is shared, closed at app shutdown

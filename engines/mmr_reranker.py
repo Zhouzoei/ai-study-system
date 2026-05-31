@@ -32,12 +32,15 @@ class MMRReranker:
     def _mmr_with_embeddings(
         self, query: str, candidates: List[Dict], k: int
     ) -> List[Dict]:
-        query_vec = self.embed_func([query])[0]
+        query_vectors = self.embed_func([query])
+        if not query_vectors or len(query_vectors) == 0:
+            return candidates[:k]
+        query_vec = query_vectors[0]
 
-        cand_vecs = []
-        for c in candidates:
-            vec = self.embed_func([c["content"][:500]])[0]
-            cand_vecs.append(vec)
+        cand_texts = [c["content"][:500] for c in candidates]
+        cand_vecs = self.embed_func(cand_texts)
+        if not cand_vecs:
+            return candidates[:k]
 
         query_norm = self._l2_norm(query_vec)
         cand_norms = [self._l2_norm(v) for v in cand_vecs]

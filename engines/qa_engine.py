@@ -42,11 +42,13 @@ class QAEngine:
         adaptive_retriever=None,
         knowledge_graph=None,
         llm_func: Optional[Callable] = None,
+        learning_context_builder=None,
     ):
         self.pipeline = pipeline
         self.adaptive_retriever = adaptive_retriever
         self.knowledge_graph = knowledge_graph
         self.llm_func = llm_func
+        self.learning_context_builder = learning_context_builder
 
     def ask(
         self,
@@ -128,78 +130,46 @@ class QAEngine:
 
         conv_text = ""
         if session_id and self.pipeline:
-            conv_context = self.pipeline.conversation_memory.get_context_window(
-                session_id, window_size=4
+            conv_context = self.pipeline.conversation_memory.get_full_context(
+                session_id, query=question, max_tokens=3000,
+                include_relevant_history=False,
+                include_user_preferences=False,
             )
             if conv_context:
                 conv_parts = []
-                for msg in conv_context[-4:]:
+                for msg in conv_context[-6:]:
                     role = msg.get("role", "user")
                     content = msg.get("content", "")
                     conv_parts.append(f"[{role}]: {content[:150]}")
                 conv_text = "\n[对话历史]:\n" + "\n".join(conv_parts) + "\n"
 
         query_type = query_analysis.get("query_type", "factual")
-        answer_guidance = self._get_answer_guidance(query_type)
 
-        prompt = f"""{answer_guidance}
-{conv_text}[参考资料]:
+        learning_context = ""
+        if self.learning_context_builder and self.pipeline:
+            session = self.pipeline.conversation_memory.get_session(session_id) if session_id else None
+            uid = session.user_id if session else "default"
+            learning_context = self.learning_context_builder.build_system_context(uid, session_id)
+
+        if self.pipeline and hasattr(self.pipeline, 'render_prompt'):
+            prompt = self.pipeline.render_prompt("qa",
+                system_prompt=self.pipeline.render_prompt("system", learning_context=learning_context),
+                conv_text=conv_text,
+                context_text=context_text,
+                kg_text=kg_text,
+                question=question,
+            )
+        else:
+            prompt = f"""{conv_text}[参考资料]:
 {context_text}
 {kg_text}
 
-问题: {question}
-
-请给出详细、准确的回答:"""
+问题: {question}"""
 
         try:
             return self.llm_func(prompt)
         except Exception as e:
             return f"[回答生成失败: {e}]"
-
-    def _get_answer_guidance(self, query_type: str) -> str:
-        prefix = (
-            "你是一个专业的深度学习知识助手。请严格基于参考资料回答，不要添加参考资料中没有的信息。"
-            "如果参考资料不足以完整回答问题，请明确指出哪些部分没有找到相关信息。"
-            "在回答中引用具体的章节标题作为来源参考。\n\n"
-        )
-        guidance_map = {
-            "factual": (
-                f"{prefix}"
-                "请基于参考资料给出精确的定义或描述。\n"
-                "- 如果资料中有明确定义，直接引用并解释\n"
-                "- 如果资料中没有相关信息，明确回答'参考资料中未找到相关说明'\n"
-                "- 使用编号列表或段落形式组织内容"
-            ),
-            "reasoning": (
-                f"{prefix}"
-                "请基于参考资料深入分析问题和原理。\n"
-                "- 使用'因为...所以...'的逻辑结构解释因果关系\n"
-                "- 如果有多个因素，逐一分析并说明它们之间的关系\n"
-                "- 引用具体的章节标题作为分析依据"
-            ),
-            "exploratory": (
-                f"{prefix}"
-                "请提供多种可行的方法或方案。\n"
-                "- 列出每种方法的核心思路和适用场景\n"
-                "- 简要对比各方法的优缺点\n"
-                "- 如果资料中有推荐，给出推荐建议"
-            ),
-            "comparison": (
-                f"{prefix}"
-                "请对比分析不同选项。\n"
-                "- 优先使用表格展示差异点\n"
-                "- 列出各选项的核心特征、优势和局限\n"
-                "- 如果资料中有明确的选择建议，请引用"
-            ),
-            "procedural": (
-                f"{prefix}"
-                "请给出详细的操作步骤。\n"
-                "- 按顺序编号，确保每一步清晰可执行\n"
-                "- 对关键步骤补充说明其目的\n"
-                "- 如果有注意事项，单独列出"
-            ),
-        }
-        return guidance_map.get(query_type, guidance_map["factual"])
 
     def _estimate_confidence(
         self,

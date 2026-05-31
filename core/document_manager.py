@@ -1,5 +1,4 @@
 import json
-import sqlite3
 import time
 import uuid
 import hashlib
@@ -7,7 +6,7 @@ from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, field
 from enum import Enum
 
-from config import config
+from core.database import DatabaseManager, get_database, escape_like
 
 
 class DocStatus(str, Enum):
@@ -94,14 +93,17 @@ class DocumentVersion:
 
 
 class DocumentManager:
-    def __init__(self, db_path: Optional[str] = None):
-        self.db_path = db_path or config.HIERARCHICAL_TREE_DB.replace("tree_store", "document")
+    def __init__(self, db: Optional[DatabaseManager] = None, db_path: Optional[str] = None):
+        if db is not None:
+            self.db = db
+        elif db_path is not None:
+            self.db = get_database(db_path)
+        else:
+            self.db = get_database()
         self._init_db()
 
     def _init_db(self):
-        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("""
+        self.db.execute("""
             CREATE TABLE IF NOT EXISTS documents (
                 doc_id TEXT PRIMARY KEY,
                 title TEXT NOT NULL DEFAULT '',
@@ -121,7 +123,7 @@ class DocumentManager:
                 metadata TEXT NOT NULL DEFAULT '{}'
             )
         """)
-        self.conn.execute("""
+        self.db.execute("""
             CREATE TABLE IF NOT EXISTS document_versions (
                 version_id TEXT PRIMARY KEY,
                 doc_id TEXT NOT NULL,
@@ -134,16 +136,16 @@ class DocumentManager:
                 FOREIGN KEY (doc_id) REFERENCES documents(doc_id)
             )
         """)
-        self.conn.execute("""
+        self.db.execute("""
             CREATE INDEX IF NOT EXISTS idx_doc_status ON documents(status)
         """)
-        self.conn.execute("""
+        self.db.execute("""
             CREATE INDEX IF NOT EXISTS idx_doc_tags ON documents(tags)
         """)
-        self.conn.execute("""
+        self.db.execute("""
             CREATE INDEX IF NOT EXISTS idx_ver_doc ON document_versions(doc_id)
         """)
-        self.conn.commit()
+        self.db.commit()
 
     def register_document(
         self,
@@ -203,7 +205,7 @@ class DocumentManager:
         self._save_document(doc)
 
     def get_document(self, doc_id: str) -> Optional[Document]:
-        cursor = self.conn.execute(
+        cursor = self.db.execute(
             "SELECT doc_id, title, source, content_hash, file_type, status, "
             "total_chars, node_count, entity_count, relation_count, "
             "tags, description, version, created_at, updated_at, metadata "
@@ -239,7 +241,7 @@ class DocumentManager:
         query += " ORDER BY updated_at DESC LIMIT ? OFFSET ?"
         params.extend([limit, offset])
 
-        cursor = self.conn.execute(query, params)
+        cursor = self.db.execute(query, params)
         rows = cursor.fetchall()
         return [
             {
@@ -260,18 +262,19 @@ class DocumentManager:
         ]
 
     def delete_document(self, doc_id: str) -> bool:
-        self.conn.execute("DELETE FROM document_versions WHERE doc_id = ?", (doc_id,))
-        self.conn.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
-        self.conn.commit()
+        self.db.execute("DELETE FROM document_versions WHERE doc_id = ?", (doc_id,))
+        self.db.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
+        self.db.commit()
         return True
 
     def search_documents(self, keyword: str, limit: int = 10) -> List[Dict[str, Any]]:
-        cursor = self.conn.execute(
+        safe = escape_like(keyword)
+        cursor = self.db.execute(
             "SELECT doc_id, title, source, file_type, status, total_chars, tags, version, created_at "
             "FROM documents "
-            "WHERE title LIKE ? OR description LIKE ? OR source LIKE ? "
+            "WHERE title LIKE ? ESCAPE '\\' OR description LIKE ? ESCAPE '\\' OR source LIKE ? ESCAPE '\\' "
             "ORDER BY updated_at DESC LIMIT ?",
-            (f"%{keyword}%", f"%{keyword}%", f"%{keyword}%", limit),
+            (f"%{safe}%", f"%{safe}%", f"%{safe}%", limit),
         )
         rows = cursor.fetchall()
         return [
@@ -290,7 +293,7 @@ class DocumentManager:
         ]
 
     def get_document_versions(self, doc_id: str) -> List[Dict[str, Any]]:
-        cursor = self.conn.execute(
+        cursor = self.db.execute(
             "SELECT version_id, doc_id, version, content_hash, change_description, "
             "total_chars, node_count, created_at "
             "FROM document_versions WHERE doc_id = ? ORDER BY version DESC",
@@ -312,15 +315,15 @@ class DocumentManager:
         ]
 
     def get_stats(self) -> Dict[str, Any]:
-        cursor = self.conn.execute("SELECT COUNT(*) FROM documents")
+        cursor = self.db.execute("SELECT COUNT(*) FROM documents")
         total_docs = cursor.fetchone()[0]
-        cursor = self.conn.execute("SELECT status, COUNT(*) FROM documents GROUP BY status")
+        cursor = self.db.execute("SELECT status, COUNT(*) FROM documents GROUP BY status")
         status_dist = {row[0]: row[1] for row in cursor.fetchall()}
-        cursor = self.conn.execute("SELECT SUM(total_chars), SUM(node_count) FROM documents")
+        cursor = self.db.execute("SELECT SUM(total_chars), SUM(node_count) FROM documents")
         row = cursor.fetchone()
         total_chars = row[0] or 0
         total_nodes = row[1] or 0
-        cursor = self.conn.execute(
+        cursor = self.db.execute(
             "SELECT tags FROM documents WHERE tags != '[]'"
         )
         all_tags = set()
@@ -337,7 +340,7 @@ class DocumentManager:
         }
 
     def _save_document(self, doc: Document):
-        self.conn.execute(
+        self.db.execute(
             """INSERT OR REPLACE INTO documents
             (doc_id, title, source, content_hash, file_type, status,
              total_chars, node_count, entity_count, relation_count,
@@ -362,7 +365,7 @@ class DocumentManager:
                 json.dumps(doc.metadata, ensure_ascii=False),
             ),
         )
-        self.conn.commit()
+        self.db.commit()
 
     def _save_version(
         self,
@@ -381,7 +384,7 @@ class DocumentManager:
             total_chars=total_chars,
             node_count=node_count,
         )
-        self.conn.execute(
+        self.db.execute(
             """INSERT OR REPLACE INTO document_versions
             (version_id, doc_id, version, content_hash, change_description, total_chars, node_count, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -396,7 +399,7 @@ class DocumentManager:
                 ver.created_at,
             ),
         )
-        self.conn.commit()
+        self.db.commit()
 
     def _row_to_document(self, row) -> Document:
         return Document(
@@ -419,4 +422,4 @@ class DocumentManager:
         )
 
     def close(self):
-        self.conn.close()
+        pass  # DatabaseManager is shared, closed at app shutdown

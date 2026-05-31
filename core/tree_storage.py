@@ -1,5 +1,4 @@
 import json
-import sqlite3
 import uuid as uuid_mod
 from typing import List, Optional, Dict, Any
 from qdrant_client import QdrantClient
@@ -12,26 +11,31 @@ from qdrant_client.models import (
     MatchValue,
 )
 from core.hierarchical_chunker import ChunkNode
+from core.database import DatabaseManager, get_database
 from config import config
 
 
 class TreeStorage:
     def __init__(
         self,
-        sqlite_path: Optional[str] = None,
+        db: Optional[DatabaseManager] = None,
         qdrant_url: Optional[str] = None,
         qdrant_api_key: Optional[str] = None,
         collection_name: Optional[str] = None,
+        sqlite_path: Optional[str] = None,  # deprecated, kept for backward compat
     ):
-        self.sqlite_path = sqlite_path or config.HIERARCHICAL_TREE_DB
+        if db is not None:
+            self.db = db
+        elif sqlite_path is not None:
+            self.db = get_database(sqlite_path)
+        else:
+            self.db = get_database()
         self.collection_name = collection_name or config.HIERARCHICAL_COLLECTION
         self._init_sqlite()
         self._init_qdrant(qdrant_url, qdrant_api_key)
 
     def _init_sqlite(self):
-        self.conn = sqlite3.connect(self.sqlite_path, check_same_thread=False)
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("""
+        self.db.execute("""
             CREATE TABLE IF NOT EXISTS tree_nodes (
                 node_id TEXT PRIMARY KEY,
                 level INTEGER NOT NULL,
@@ -45,16 +49,16 @@ class TreeStorage:
                 end_char INTEGER NOT NULL DEFAULT 0
             )
         """)
-        self.conn.execute("""
+        self.db.execute("""
             CREATE INDEX IF NOT EXISTS idx_level ON tree_nodes(level)
         """)
-        self.conn.execute("""
+        self.db.execute("""
             CREATE INDEX IF NOT EXISTS idx_parent ON tree_nodes(parent_id)
         """)
-        self.conn.execute("""
+        self.db.execute("""
             CREATE INDEX IF NOT EXISTS idx_doc ON tree_nodes(doc_id)
         """)
-        self.conn.commit()
+        self.db.commit()
 
     def _init_qdrant(self, url: Optional[str], api_key: Optional[str]):
         self.qdrant = None
@@ -66,7 +70,8 @@ class TreeStorage:
                 self.qdrant = QdrantClient(
                     url=cloud_url,
                     api_key=cloud_key,
-                    timeout=10,
+                    timeout=config.QDRANT_TIMEOUT,
+                    check_compatibility=False,
                 )
                 existing = [c.name for c in self.qdrant.get_collections().collections]
                 if self.collection_name not in existing:
@@ -77,6 +82,12 @@ class TreeStorage:
                             distance=Distance.COSINE,
                         ),
                     )
+                else:
+                    info = self.qdrant.get_collection(self.collection_name)
+                    existing_dim = info.config.params.vectors.size
+                    if existing_dim != config.QDRANT_VECTOR_SIZE:
+                        print(f"[TreeStorage] WARNING: Qdrant collection '{self.collection_name}' exists with dimension {existing_dim}, "
+                              f"but config.QDRANT_VECTOR_SIZE={config.QDRANT_VECTOR_SIZE}. Using existing dimension {existing_dim}.")
                 print(f"[TreeStorage] Qdrant cloud connected: {self.collection_name}")
                 return
             except Exception as e:
@@ -114,7 +125,7 @@ class TreeStorage:
             self._store_sqlite_node(node)
 
     def _store_sqlite_node(self, node: ChunkNode):
-        self.conn.execute(
+        self.db.execute(
             """
             INSERT OR REPLACE INTO tree_nodes
             (node_id, level, content, title, children_ids, parent_id, metadata, doc_id, start_char, end_char)
@@ -133,7 +144,7 @@ class TreeStorage:
                 node.end_char,
             ),
         )
-        self.conn.commit()
+        self.db.commit()
 
     def _store_l3_to_qdrant(self, l3_nodes: List[ChunkNode], embed_func):
         if not self.qdrant:
@@ -166,8 +177,79 @@ class TreeStorage:
                 points=points[i : i + batch_size],
             )
 
+    def store_concepts(self, concepts: List[Dict], embed_func):
+        if not self.qdrant or not concepts:
+            return
+        texts = []
+        for c in concepts:
+            source = c.get("definition", "") or c.get("concept", "")
+            keywords = " ".join(c.get("keywords", []))
+            texts.append(f"{source} {keywords}")
+        vectors = embed_func(texts)
+
+        points = []
+        for i, c in enumerate(concepts):
+            cid = f"concept_{c.get('concept', str(i))}"
+            points.append(
+                PointStruct(
+                    id=self._node_id_to_uuid(cid),
+                    vector=vectors[i],
+                    payload={
+                        "node_id": cid,
+                        "is_concept": True,
+                        "concept": c.get("concept", ""),
+                        "definition": c.get("definition", ""),
+                        "bloom_level": c.get("bloom_level", "理解"),
+                        "prerequisites": c.get("prerequisites", []),
+                        "difficulty": c.get("difficulty", 0.5),
+                        "keywords": c.get("keywords", []),
+                        "doc_id": c.get("doc_id", ""),
+                    },
+                )
+            )
+
+        batch_size = 100
+        for i in range(0, len(points), batch_size):
+            self.qdrant.upsert(
+                collection_name=self.collection_name,
+                points=points[i : i + batch_size],
+            )
+
+    def search_concepts(
+        self, query_vector: List[float], top_k: int = 5, doc_id: Optional[str] = None
+    ) -> List[Dict]:
+        if not self.qdrant:
+            return []
+        from qdrant_client.models import Filter, FieldCondition, MatchValue
+        must = [FieldCondition(key="is_concept", match=MatchValue(value=True))]
+        if doc_id:
+            must.append(FieldCondition(key="doc_id", match=MatchValue(value=doc_id)))
+        query_filter = Filter(must=must)
+
+        response = self.qdrant.query_points(
+            collection_name=self.collection_name,
+            query=query_vector,
+            limit=top_k,
+            query_filter=query_filter,
+        )
+        return [
+            {
+                "node_id": r.payload.get("node_id", str(r.id)),
+                "score": r.score,
+                "concept": r.payload.get("concept", ""),
+                "definition": r.payload.get("definition", ""),
+                "bloom_level": r.payload.get("bloom_level", ""),
+                "prerequisites": r.payload.get("prerequisites", []),
+                "difficulty": r.payload.get("difficulty", 0.5),
+                "keywords": r.payload.get("keywords", []),
+                "doc_id": r.payload.get("doc_id", ""),
+                "is_concept": True,
+            }
+            for r in response.points
+        ]
+
     def get_node(self, node_id: str) -> Optional[ChunkNode]:
-        cursor = self.conn.execute(
+        cursor = self.db.execute(
             "SELECT * FROM tree_nodes WHERE node_id = ?", (node_id,)
         )
         row = cursor.fetchone()
@@ -250,7 +332,7 @@ class TreeStorage:
         ]
 
     def get_all_l3_content(self, doc_id: Optional[str] = None) -> List[Dict]:
-        cursor = self.conn.execute(
+        cursor = self.db.execute(
             "SELECT node_id, content, title, parent_id FROM tree_nodes WHERE level = 3"
             + (" AND doc_id = ?" if doc_id else ""),
             (doc_id,) if doc_id else (),
@@ -268,12 +350,12 @@ class TreeStorage:
 
     def get_nodes_by_level(self, level: int, doc_id: Optional[str] = None) -> List[ChunkNode]:
         if doc_id:
-            cursor = self.conn.execute(
+            cursor = self.db.execute(
                 "SELECT * FROM tree_nodes WHERE level = ? AND doc_id = ?",
                 (level, doc_id),
             )
         else:
-            cursor = self.conn.execute(
+            cursor = self.db.execute(
                 "SELECT * FROM tree_nodes WHERE level = ?", (level,)
             )
         return [self._row_to_node(row) for row in cursor.fetchall()]
@@ -286,15 +368,15 @@ class TreeStorage:
                 collection_name=self.collection_name,
                 points_selector=uuids,
             )
-        self.conn.execute("DELETE FROM tree_nodes WHERE doc_id = ?", (doc_id,))
-        self.conn.commit()
+        self.db.execute("DELETE FROM tree_nodes WHERE doc_id = ?", (doc_id,))
+        self.db.commit()
 
     def get_stats(self) -> Dict[str, Any]:
-        cursor = self.conn.execute(
+        cursor = self.db.execute(
             "SELECT level, COUNT(*) FROM tree_nodes GROUP BY level"
         )
         level_counts = {row[0]: row[1] for row in cursor.fetchall()}
-        cursor = self.conn.execute("SELECT COUNT(DISTINCT doc_id) FROM tree_nodes")
+        cursor = self.db.execute("SELECT COUNT(DISTINCT doc_id) FROM tree_nodes")
         doc_count = cursor.fetchone()[0]
         return {
             "level_counts": level_counts,
@@ -317,4 +399,4 @@ class TreeStorage:
         )
 
     def close(self):
-        self.conn.close()
+        pass  # DatabaseManager is shared, Qdrant connection is stateless

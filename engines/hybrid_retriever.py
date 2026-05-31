@@ -1,10 +1,13 @@
 import math
 import re
+import threading
 from collections import Counter, defaultdict
 from typing import List, Dict, Any, Optional, Callable
 
 from core.tree_storage import TreeStorage
 from config import config
+
+_jieba_lock = threading.Lock()
 
 
 class BM25Index:
@@ -17,6 +20,7 @@ class BM25Index:
         self.avgdl: float = 0.0
         self.n_docs: int = 0
         self.idf: Dict[str, float] = {}
+        self.token_freqs_list: List[Counter] = []
         self._domain_dict_loaded = False
 
     def build(self, documents: List[Dict]):
@@ -24,6 +28,7 @@ class BM25Index:
         self.n_docs = len(documents)
         self.doc_lens = []
         self.doc_freqs = defaultdict(int)
+        self.token_freqs_list = []
 
         if not self._domain_dict_loaded:
             self._build_domain_dict(documents)
@@ -32,6 +37,8 @@ class BM25Index:
         for doc in documents:
             tokens = self.tokenize(doc["content"])
             self.doc_lens.append(len(tokens))
+            tf_counter = Counter(tokens)
+            self.token_freqs_list.append(tf_counter)
             unique_tokens = set(tokens)
             for token in unique_tokens:
                 self.doc_freqs[token] += 1
@@ -76,20 +83,21 @@ class BM25Index:
                 if pmi > 1.5:
                     candidates.append((ngram, freq, pmi))
 
-        for ngram, freq, _ in candidates:
-            jieba.add_word(ngram, freq=freq, tag="n")
+        with _jieba_lock:
+            for ngram, freq, _ in candidates:
+                jieba.add_word(ngram, freq=freq, tag="n")
 
-        trigram_candidates = []
-        for ngram, freq in trigram_counts.items():
-            if freq < min_freq:
-                continue
-            bi1 = bigram_counts.get(ngram[:2], 0)
-            bi2 = bigram_counts.get(ngram[1:], 0)
-            if bi1 > 0 and bi2 > 0 and freq >= min(bi1, bi2) * 0.8:
-                trigram_candidates.append((ngram, freq))
+            trigram_candidates = []
+            for ngram, freq in trigram_counts.items():
+                if freq < min_freq:
+                    continue
+                bi1 = bigram_counts.get(ngram[:2], 0)
+                bi2 = bigram_counts.get(ngram[1:], 0)
+                if bi1 > 0 and bi2 > 0 and freq >= min(bi1, bi2) * 0.8:
+                    trigram_candidates.append((ngram, freq))
 
-        for ngram, freq in trigram_candidates:
-            jieba.add_word(ngram, freq=freq, tag="n")
+            for ngram, freq in trigram_candidates:
+                jieba.add_word(ngram, freq=freq, tag="n")
 
     def tokenize(self, text: str) -> List[str]:
         import jieba
@@ -97,7 +105,8 @@ class BM25Index:
         tokens = []
         for token in re.findall(r"[\u4e00-\u9fff]+|[a-zA-Z0-9]+", text):
             if re.match(r"^[\u4e00-\u9fff]+$", token):
-                tokens.extend(jieba.lcut(token))
+                with _jieba_lock:
+                    tokens.extend(jieba.lcut(token))
             else:
                 tokens.append(token)
         return tokens
@@ -107,8 +116,7 @@ class BM25Index:
         scores = []
 
         for idx, doc in enumerate(self.corpus):
-            doc_tokens = self.tokenize(doc["content"])
-            token_freqs = Counter(doc_tokens)
+            token_freqs = self.token_freqs_list[idx] if idx < len(self.token_freqs_list) else Counter()
             score = 0.0
 
             for token in query_tokens:
@@ -190,7 +198,10 @@ class HybridRetriever:
         if not self.embed_func:
             return []
 
-        query_vector = self.embed_func([query])[0]
+        query_vectors = self.embed_func([query])
+        if not query_vectors or len(query_vectors) == 0:
+            return []
+        query_vector = query_vectors[0]
         results = self.storage.search_l3_by_vector(query_vector, top_k, doc_id)
 
         return [

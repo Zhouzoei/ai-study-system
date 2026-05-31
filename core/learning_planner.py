@@ -1,12 +1,12 @@
 import json
-import sqlite3
+import re
 import time
 import uuid
 from typing import List, Dict, Any, Optional, Callable
 from dataclasses import dataclass, field
 from enum import Enum
 
-from config import config
+from core.database import DatabaseManager, get_database
 
 
 class PlanStatus(str, Enum):
@@ -96,17 +96,23 @@ class LearningPlan:
 class LearningPlanner:
     def __init__(
         self,
-        db_path: Optional[str] = None,
+        db: Optional[DatabaseManager] = None,
         llm_func: Optional[Callable] = None,
+        db_path: Optional[str] = None,
+        knowledge_graph=None,
     ):
-        self.db_path = db_path or config.HIERARCHICAL_TREE_DB.replace("tree_store", "learning_plan")
+        if db is not None:
+            self.db = db
+        elif db_path is not None:
+            self.db = get_database(db_path)
+        else:
+            self.db = get_database()
         self.llm_func = llm_func
+        self.knowledge_graph = knowledge_graph
         self._init_db()
 
     def _init_db(self):
-        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("""
+        self.db.execute("""
             CREATE TABLE IF NOT EXISTS learning_plans (
                 plan_id TEXT PRIMARY KEY,
                 user_id TEXT NOT NULL DEFAULT 'default',
@@ -119,7 +125,7 @@ class LearningPlanner:
                 updated_at REAL NOT NULL
             )
         """)
-        self.conn.execute("""
+        self.db.execute("""
             CREATE TABLE IF NOT EXISTS learning_tasks (
                 task_id TEXT PRIMARY KEY,
                 plan_id TEXT NOT NULL,
@@ -135,13 +141,13 @@ class LearningPlanner:
                 FOREIGN KEY (plan_id) REFERENCES learning_plans(plan_id)
             )
         """)
-        self.conn.execute("""
+        self.db.execute("""
             CREATE INDEX IF NOT EXISTS idx_task_plan ON learning_tasks(plan_id)
         """)
-        self.conn.execute("""
+        self.db.execute("""
             CREATE INDEX IF NOT EXISTS idx_plan_user ON learning_plans(user_id)
         """)
-        self.conn.commit()
+        self.db.commit()
 
     def create_plan_from_doc(
         self,
@@ -186,7 +192,7 @@ class LearningPlanner:
         return plan
 
     def get_plan(self, plan_id: str) -> Optional[LearningPlan]:
-        cursor = self.conn.execute(
+        cursor = self.db.execute(
             "SELECT plan_id, user_id, title, description, doc_id, status, "
             "total_estimated_minutes, created_at, updated_at "
             "FROM learning_plans WHERE plan_id = ?",
@@ -217,11 +223,11 @@ class LearningPlanner:
 
         plan.status = status
         plan.updated_at = time.time()
-        self.conn.execute(
+        self.db.execute(
             "UPDATE learning_plans SET status = ?, updated_at = ? WHERE plan_id = ?",
             (status.value, time.time(), plan_id),
         )
-        self.conn.commit()
+        self.db.commit()
         return plan
 
     def update_task_status(self, plan_id: str, task_id: str, status: str) -> Optional[LearningPlan]:
@@ -234,11 +240,11 @@ class LearningPlanner:
                 task.status = status
                 break
 
-        self.conn.execute(
+        self.db.execute(
             "UPDATE learning_tasks SET status = ? WHERE task_id = ?",
             (status, task_id),
         )
-        self.conn.commit()
+        self.db.commit()
 
         all_done = all(t.status in ("completed", "skipped") for t in plan.tasks)
         if all_done:
@@ -291,13 +297,13 @@ class LearningPlanner:
         status: Optional[PlanStatus] = None,
     ) -> List[Dict[str, Any]]:
         if status:
-            cursor = self.conn.execute(
+            cursor = self.db.execute(
                 "SELECT plan_id, title, status, total_estimated_minutes, created_at, updated_at "
                 "FROM learning_plans WHERE user_id = ? AND status = ? ORDER BY updated_at DESC",
                 (user_id, status.value),
             )
         else:
-            cursor = self.conn.execute(
+            cursor = self.db.execute(
                 "SELECT plan_id, title, status, total_estimated_minutes, created_at, updated_at "
                 "FROM learning_plans WHERE user_id = ? ORDER BY updated_at DESC",
                 (user_id,),
@@ -344,9 +350,23 @@ class LearningPlanner:
         }
 
     def delete_plan(self, plan_id: str):
-        self.conn.execute("DELETE FROM learning_tasks WHERE plan_id = ?", (plan_id,))
-        self.conn.execute("DELETE FROM learning_plans WHERE plan_id = ?", (plan_id,))
-        self.conn.commit()
+        self.db.execute("DELETE FROM learning_tasks WHERE plan_id = ?", (plan_id,))
+        self.db.execute("DELETE FROM learning_plans WHERE plan_id = ?", (plan_id,))
+        self.db.commit()
+
+    @staticmethod
+    def _strip_section(title: str) -> str:
+        return re.sub(r"^\d+(?:[.\-]\d+)*\s*", "", title).strip()
+
+    def _find_task_index_by_name(self, name: str, node_titles: List[tuple]) -> int:
+        norm = self._strip_section(name).lower()
+        for i, t in node_titles:
+            if self._strip_section(t).lower() == norm:
+                return i
+        for i, t in node_titles:
+            if norm in self._strip_section(t).lower() or self._strip_section(t).lower() in norm:
+                return i
+        return -1
 
     def _generate_tasks_from_nodes(
         self,
@@ -354,13 +374,36 @@ class LearningPlanner:
         daily_minutes: int,
     ) -> List[LearningTask]:
         tasks = []
-        prev_task_id = None
 
+        node_titles = [(i, n.get("title", "")) for i, n in enumerate(l2_nodes)]
+
+        kg_deps = {}
+        if self.knowledge_graph:
+            for i, title in node_titles:
+                prereq_ids = set()
+                stripped = self._strip_section(title)
+                entity = self.knowledge_graph.query_entity(title)
+                if not entity and stripped != title:
+                    entity = self.knowledge_graph.query_entity(stripped)
+                if entity:
+                    related = self.knowledge_graph.get_related_entities(
+                        entity.get("name", stripped), relation_type="prerequisite_of", limit=20
+                    )
+                    for r in related:
+                        pname = r.get("name", "")
+                        j = self._find_task_index_by_name(pname, node_titles)
+                        if j >= 0:
+                            prereq_ids.add(j)
+                kg_deps[i] = prereq_ids
+
+        task_map = {}
         for i, node in enumerate(l2_nodes):
             content_len = len(node.get("content", ""))
             est_minutes = max(15, min(90, content_len // 50))
 
-            prerequisites = [prev_task_id] if prev_task_id else []
+            prereq_ids = kg_deps.get(i, set()) if kg_deps else set()
+            prerequisites = [task_map[pi] for pi in sorted(prereq_ids) if pi in task_map]
+
             task = LearningTask(
                 title=node.get("title", f"学习任务 {i+1}"),
                 description=node.get("content", "")[:300],
@@ -372,7 +415,7 @@ class LearningPlanner:
                 order=i,
             )
             tasks.append(task)
-            prev_task_id = task.task_id
+            task_map[i] = task.task_id
 
         return tasks
 
@@ -402,19 +445,25 @@ class LearningPlanner:
             task_defs = json.loads(clean)
 
             tasks = []
-            prev_id = None
             for i, td in enumerate(task_defs):
+                task_title = td.get("title", f"任务{i+1}")
+                prereq_titles = td.get("prerequisites", [])
+                prereq_ids = []
+                if self.knowledge_graph and prereq_titles:
+                    for pt in prereq_titles:
+                        for t in tasks:
+                            if t.title == pt:
+                                prereq_ids.append(t.task_id)
                 task = LearningTask(
-                    title=td.get("title", f"任务{i+1}"),
+                    title=task_title,
                     description=td.get("description", ""),
                     priority=TaskPriority(td.get("priority", "medium")),
                     estimated_minutes=td.get("estimated_minutes", 30),
-                    prerequisites=[prev_id] if prev_id else [],
+                    prerequisites=prereq_ids,
                     status="pending",
                     order=i,
                 )
                 tasks.append(task)
-                prev_id = task.task_id
             return tasks
         except Exception:
             return self._generate_tasks_from_template(goal, daily_minutes, total_days)
@@ -453,7 +502,7 @@ class LearningPlanner:
         return tasks
 
     def _save_plan(self, plan: LearningPlan):
-        self.conn.execute(
+        self.db.execute(
             """INSERT OR REPLACE INTO learning_plans
             (plan_id, user_id, title, description, doc_id, status, total_estimated_minutes, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -469,13 +518,13 @@ class LearningPlanner:
                 plan.updated_at,
             ),
         )
-        self.conn.commit()
+        self.db.commit()
 
         for task in plan.tasks:
             self._save_task(plan.plan_id, task)
 
     def _save_task(self, plan_id: str, task: LearningTask):
-        self.conn.execute(
+        self.db.execute(
             """INSERT OR REPLACE INTO learning_tasks
             (task_id, plan_id, title, description, priority, estimated_minutes,
              prerequisites, knowledge_nodes, status, task_order, metadata)
@@ -494,10 +543,10 @@ class LearningPlanner:
                 json.dumps(task.metadata, ensure_ascii=False),
             ),
         )
-        self.conn.commit()
+        self.db.commit()
 
     def _load_tasks(self, plan_id: str) -> List[LearningTask]:
-        cursor = self.conn.execute(
+        cursor = self.db.execute(
             "SELECT task_id, title, description, priority, estimated_minutes, "
             "prerequisites, knowledge_nodes, status, task_order, metadata "
             "FROM learning_tasks WHERE plan_id = ? ORDER BY task_order",
@@ -521,4 +570,4 @@ class LearningPlanner:
         ]
 
     def close(self):
-        self.conn.close()
+        pass  # DatabaseManager is shared, closed at app shutdown

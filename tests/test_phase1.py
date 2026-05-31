@@ -16,6 +16,22 @@ from engines.hybrid_retriever import HybridRetriever, BM25Index
 from engines.reranker import CrossEncoderReranker
 from engines.evaluator import RAGASEvaluator, EvalSample, RetrievalTracer
 
+
+def _safe_remove_db(db_path: str):
+    """Remove a SQLite database file and its WAL/checkpoint siblings."""
+    for suffix in ("", "-shm", "-wal"):
+        p = db_path + suffix
+        if os.path.exists(p):
+            try:
+                os.remove(p)
+            except PermissionError:
+                time.sleep(0.1)
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+
+
 SAMPLE_DOCUMENT = """# 机器学习基础
 
 ## 2.1 监督学习
@@ -200,7 +216,7 @@ def test_storage(nodes):
 
     db_path = "test_tree_store.db"
     if os.path.exists(db_path):
-        os.remove(db_path)
+            _safe_remove_db(db_path)
 
     storage = TreeStorage(
         sqlite_path=db_path,
@@ -242,9 +258,8 @@ def test_storage(nodes):
     stats = storage.get_stats()
     print(f"\nStorage stats: {json.dumps(stats, ensure_ascii=False)}")
 
-    storage.close()
-    if os.path.exists(db_path):
-        os.remove(db_path)
+    storage.db.close()
+    _safe_remove_db(db_path)
 
     print("\n[PASS] Tree Storage test passed")
     return True
@@ -257,7 +272,7 @@ def test_retriever(nodes):
 
     db_path = "test_retriever.db"
     if os.path.exists(db_path):
-        os.remove(db_path)
+            _safe_remove_db(db_path)
 
     storage = TreeStorage(
         sqlite_path=db_path,
@@ -293,9 +308,8 @@ def test_retriever(nodes):
                 print(f"  Chain: L1={chain['l1_title']} > L2={chain['l2_title']} > L3={chain['l3_title'][:30]}...")
                 assert len(ctx) > 0, "Assembled context should not be empty!"
 
-    storage.close()
-    if os.path.exists(db_path):
-        os.remove(db_path)
+    storage.db.close()
+    _safe_remove_db(db_path)
 
     print("\n[PASS] Hierarchical Retriever test passed")
     return True
@@ -339,7 +353,7 @@ def test_hybrid_retriever(nodes):
 
     db_path = "test_hybrid.db"
     if os.path.exists(db_path):
-        os.remove(db_path)
+            _safe_remove_db(db_path)
 
     storage = TreeStorage(
         sqlite_path=db_path,
@@ -371,9 +385,8 @@ def test_hybrid_retriever(nodes):
             score = r.get("rrf_score", r.get("score", 0))
             print(f"    [{source}] score={score:.4f} | {r['content'][:60]}...")
 
-    storage.close()
-    if os.path.exists(db_path):
-        os.remove(db_path)
+    storage.db.close()
+    _safe_remove_db(db_path)
 
     print("\n[PASS] Hybrid Retriever test passed")
     return True

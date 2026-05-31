@@ -1,28 +1,88 @@
+import json
 import time
+import logging
 from typing import List, Dict, Any, Optional, Callable, Generator
 
-from core.hierarchical_chunker import HierarchicalChunker, ChunkNode
-from core.tree_storage import TreeStorage
-from core.conversation_memory import ConversationMemory
-from core.learning_planner import LearningPlanner, PlanStatus
-from core.progress_tracker import ProgressTracker
-from core.knowledge_graph import KnowledgeGraphBuilder
+from core.conversation_memory import LayeredMemory
 from core.document_manager import DocumentManager
-from core.learning_reminder import LearningReminder
-from engines.hierarchical_retriever import HierarchicalRetriever, ContextStrategy
-from engines.hybrid_retriever import HybridRetriever
-from engines.reranker import CrossEncoderReranker
-from engines.evaluator import RAGASEvaluator, EvalSample, RetrievalTracer
-from engines.adaptive_retriever import AdaptiveRetriever, QueryClassifier
-from engines.query_rewriter import QueryRewriter
-from engines.query_expander import QueryExpander
-from engines.mmr_reranker import MMRReranker
-from engines.qa_engine import QAEngine
-from engines.learning_analytics import LearningAnalytics
+from core.background_agent import BackgroundAgent
+from core.knowledge_distiller import KnowledgeDistiller
+from core.knowledge_graph import Relation
+from utils.retrieval_utils import merge_retrieval_results
+from core.database import DatabaseManager, get_database, escape_like
+from engines.retrieval_service import RetrievalService
+from engines.knowledge_service import KnowledgeService
+from engines.progress_service import ProgressService
+from engines.agent_service import AgentService
+from engines.hierarchical_retriever import ContextStrategy
+from engines.intent_router import IntentType, IntentResult
+from engines.learner_model import LearnerModel
+from engines.resilience import ErrorCode, ERROR_USER_MESSAGES, build_degraded_answer
+from engines.evaluator import EvalSample
+from engines.guided_learning import GuidedLearningEngine
+from engines.adaptive_retriever import QueryClassifier
+from engines.learning_loop import LearningLoop
+from engines.graph_rag import GraphRAGAugmenter
+from engines.self_rag import SelfRAGCritic
 from config import config
+
+logger = logging.getLogger(__name__)
+
+
+class PipelineContext:
+    """Thin service holder. All logic lives in the four domain services."""
+
+    def __init__(self, embed_func=None, llm_func=None, llm_service=None):
+        self.embed_func = embed_func
+        self.llm_func = llm_func
+        self.llm_service = llm_service
+
+        self.document_manager = DocumentManager()
+        self.conversation_memory = LayeredMemory(llm_func=llm_func, embed_func=embed_func)
+
+        self.retrieval = RetrievalService(embed_func=embed_func, llm_func=llm_func)
+        self.knowledge = KnowledgeService(llm_func=llm_func, embed_func=embed_func)
+        self.progress = ProgressService(llm_func=llm_func)
+        self.agent = AgentService(llm_func=llm_func)
+        self.guided_learning = None
+        self.learner_model = LearnerModel(user_id="default", llm_func=llm_func)
+
+    def wire_pipeline(self, pipeline):
+        self.retrieval.wire(pipeline, self.knowledge.knowledge_graph)
+        self.knowledge.wire(
+            self.progress.progress_tracker,
+            self.document_manager,
+            self.conversation_memory,
+        )
+        self.progress.wire(
+            self.retrieval.storage,
+            self.document_manager,
+            self.knowledge.knowledge_graph,
+        )
+        self.agent.wire(pipeline, self.progress, self.knowledge)
+        self.agent.register_core_tools(pipeline)
+        if self.knowledge.learning_context:
+            self.knowledge.learning_context.analytics = self.progress.analytics
+        self.graph_rag = GraphRAGAugmenter(
+            knowledge_graph=self.knowledge.knowledge_graph,
+            llm_func=self.llm_func,
+            embed_func=self.embed_func,
+        )
+        self.self_rag = SelfRAGCritic(llm_func=self.llm_func)
+        self.guided_learning = GuidedLearningEngine(
+            knowledge_graph=self.knowledge.knowledge_graph,
+            progress_tracker=self.progress.progress_tracker,
+            storage=self.retrieval.storage,
+            pipeline=pipeline,
+            llm_func=self.llm_func,
+            embed_func=self.embed_func,
+        )
+        self.learning_loop = LearningLoop(pipeline=pipeline)
 
 
 class EnhancedRAGPipeline:
+    """Facade that coordinates four domain services: retrieval, knowledge, progress, agent."""
+
     def __init__(
         self,
         embed_func: Optional[Callable] = None,
@@ -33,81 +93,219 @@ class EnhancedRAGPipeline:
         self.llm_func = llm_func
         self.llm_service = llm_service
 
-        self.chunker = HierarchicalChunker(
-            l1_max_size=config.CHUNK_L1_MAX_SIZE,
-            l2_max_size=config.CHUNK_L2_MAX_SIZE,
-            l3_max_size=config.CHUNK_L3_MAX_SIZE,
-            l3_min_size=config.CHUNK_L3_MIN_SIZE,
-            overlap=config.CHUNK_OVERLAP,
-        )
+        self.ctx = PipelineContext(embed_func, llm_func, llm_service)
 
-        self.storage = TreeStorage()
-        self.retriever = HierarchicalRetriever(
-            tree_storage=self.storage,
-            strategy=ContextStrategy(config.CONTEXT_STRATEGY),
-            auto_merge_threshold=config.AUTO_MERGE_THRESHOLD,
-        )
-        self.hybrid_retriever = HybridRetriever(
-            tree_storage=self.storage,
-            embed_func=embed_func,
-            bm25_top_k=config.BM25_TOP_K,
-            vector_top_k=config.VECTOR_TOP_K,
-            rrf_k=config.RRF_K,
-            final_top_k=config.RETRIEVAL_TOP_K,
-        )
-        self.reranker = CrossEncoderReranker(
-            model_name=config.RERANKER_MODEL,
-            top_k=config.RERANKER_TOP_K,
-        )
-        self.evaluator = RAGASEvaluator(
-            llm_func=llm_func,
-            embed_func=embed_func,
-        )
-        self.tracer = RetrievalTracer()
+        # Set domain services before wire (register_core_tools accesses them)
+        self.retrieval = self.ctx.retrieval
+        self.knowledge = self.ctx.knowledge
+        self.progress = self.ctx.progress
+        self.agent = self.ctx.agent
 
-        self.conversation_memory = ConversationMemory(llm_func=llm_func)
-        self.learning_planner = LearningPlanner(llm_func=llm_func)
-        self.progress_tracker = ProgressTracker()
+        self.ctx.wire_pipeline(self)
 
-        self.knowledge_graph = KnowledgeGraphBuilder(llm_func=llm_func)
+        self.background_agent = BackgroundAgent(pipeline_getter=lambda: self)
+        self._active_course_id: Optional[str] = None
+        self._REFLECTION_MAX_RETRIES = 2
 
-        self.document_manager = DocumentManager()
+    def __getattr__(self, name: str):
+        known_aliases = {
+            "document_manager", "conversation_memory", "storage", "chunker",
+            "hybrid_retriever", "reranker", "mmr_reranker", "evaluator", "tracer",
+            "query_classifier", "query_rewriter", "query_expander", "retriever",
+            "adaptive_retriever", "knowledge_graph", "learning_context", "course_manager",
+            "progress_tracker", "learning_planner", "learning_reminder", "analytics",
+            "intent_router", "orchestrator", "quiz_agent", "summary_agent", "review_agent",
+            "tutor_agent", "health_checker", "event_bus", "tool_registry", "prompt_manager",
+            "guided_learning", "learner_model", "learning_loop",
+        }
+        if name in known_aliases:
+            if hasattr(self.ctx, name):
+                return getattr(self.ctx, name)
+            for svc in ("retrieval", "knowledge", "progress", "agent"):
+                svc_obj = getattr(self, svc, None)
+                if svc_obj and hasattr(svc_obj, name):
+                    return getattr(svc_obj, name)
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
-        self.learning_reminder = LearningReminder(
-            progress_tracker=self.progress_tracker,
-            learning_planner=self.learning_planner,
-            llm_func=llm_func,
-        )
+    def render_prompt(self, name: str, **kwargs) -> str:
+        return self.agent.render_prompt(name, **kwargs)
 
-        self.query_classifier = QueryClassifier()
-        self.query_rewriter = QueryRewriter(llm_func=llm_func)
-        self.query_expander = QueryExpander(knowledge_graph=self.knowledge_graph)
-        self.mmr_reranker = MMRReranker(
-            lambda_param=config.MMR_LAMBDA,
-            top_k=config.MMR_TOP_K,
-            embed_func=embed_func,
-        )
 
-        self.adaptive_retriever = AdaptiveRetriever(
-            pipeline=self,
-            knowledge_graph=self.knowledge_graph,
-            llm_func=llm_func,
-        )
+    def dispatch(
+        self,
+        message: str,
+        session_id: Optional[str] = None,
+        doc_id: Optional[str] = None,
+        user_id: str = "default",
+        force_intent: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        full_answer = ""
+        sources = []
+        intent_val = "qa"
+        confidence = 0.0
+        topic = ""
+        sub_type = ""
+        metadata = {}
+        degraded = False
+        degradation_note = ""
+        error_code = "ok"
 
-        self.qa_engine = QAEngine(
-            pipeline=self,
-            adaptive_retriever=self.adaptive_retriever,
-            knowledge_graph=self.knowledge_graph,
-            llm_func=llm_func,
-        )
+        for event in self.dispatch_stream(
+            message, session_id=session_id, doc_id=doc_id,
+            user_id=user_id, force_intent=force_intent,
+        ):
+            et = event.get("type", "")
+            if et == "intent":
+                intent_val = event.get("intent", "qa")
+                confidence = event.get("confidence", 0.0)
+                topic = event.get("topic", "")
+            elif et == "token":
+                full_answer += event.get("content", "")
+            elif et == "reflection_token":
+                full_answer += event.get("content", "")
+            elif et == "full":
+                full_answer = event.get("content", "")
+                sources = event.get("sources", [])
+            elif et == "done":
+                sources = event.get("sources", [])
+                metadata = event.get("metadata", {})
+            elif et == "degraded":
+                full_answer = event.get("content", "")
+                sources = event.get("sources", [])
+                degradation_note = event.get("degradation_note", "")
+                degraded = True
+            elif et == "error":
+                full_answer = event.get("content", "处理失败")
+                error_code = event.get("error_code", "error")
 
-        self.analytics = LearningAnalytics(
-            progress_tracker=self.progress_tracker,
-            learning_planner=self.learning_planner,
-            knowledge_graph=self.knowledge_graph,
-            tree_storage=self.storage,
-            document_manager=self.document_manager,
-        )
+        return {
+            "answer": full_answer,
+            "sources": sources,
+            "agent_type": "orchestrator",
+            "intent": intent_val,
+            "intent_confidence": confidence,
+            "topic": topic,
+            "sub_type": sub_type,
+            "metadata": metadata,
+            "degraded": degraded,
+            "degradation_note": degradation_note,
+            "error_code": error_code,
+        }
+
+    def dispatch_stream(
+        self,
+        message: str,
+        session_id: Optional[str] = None,
+        doc_id: Optional[str] = None,
+        user_id: str = "default",
+        force_intent: Optional[str] = None,
+        mode: str = "hybrid",
+    ) -> Generator[Dict[str, Any], None, None]:
+        if force_intent:
+            intent_map = {
+                "qa": IntentType.QA, "quiz": IntentType.QUIZ,
+                "summary": IntentType.SUMMARY, "review": IntentType.REVIEW,
+                "chat": IntentType.CHAT, "tutor": IntentType.TUTOR,
+                "explain": IntentType.EXPLAIN, "compare": IntentType.COMPARE,
+            }
+            itype = intent_map.get(force_intent.lower())
+            if itype:
+                logger.info(f"Force intent applied: {force_intent} for query: {message[:50]}")
+                intent_result = IntentResult(intent=itype, confidence=1.0, topic=message)
+                yield {"type": "intent", "intent": itype.label, "confidence": 1.0, "topic": message}
+                if itype == IntentType.QUIZ:
+                    for e in self.quiz_agent.generate_stream(message, topic=message, sub_type="choice", doc_id=doc_id):
+                        yield e
+                elif itype == IntentType.SUMMARY:
+                    for e in self.summary_agent.generate_stream(message, topic=message, sub_type="topic", doc_id=doc_id):
+                        yield e
+                elif itype == IntentType.REVIEW:
+                    for e in self.review_agent.generate_stream(message, topic=message, sub_type="scheduled", user_id=user_id, doc_id=doc_id):
+                        yield e
+                else:
+                    for event in self.orchestrator.process(
+                        message, session_id=session_id, doc_id=doc_id,
+                        user_id=user_id, mode=mode,
+                    ):
+                        yield event
+                return
+            else:
+                logger.warning(f"Force intent '{force_intent}' not recognized, falling back to router for query: {message[:50]}")
+                intent_result = self.intent_router.route(message)
+        else:
+            intent_result = self.intent_router.route(message)
+
+        if session_id:
+            session = self.conversation_memory.get_session(session_id)
+            if not session:
+                self.conversation_memory.create_session(
+                    user_id=user_id,
+                    title=f"Session {session_id[:12]}",
+                )
+            self.conversation_memory.add_message(
+                session_id, "user", message,
+                metadata={"source": "dispatch_stream"},
+            )
+
+        for event in self.orchestrator.process(
+            message, session_id=session_id, doc_id=doc_id,
+            user_id=user_id, mode=mode,
+        ):
+            yield event
+
+    def process_with_loop(
+        self,
+        message: str,
+        session_id: Optional[str] = None,
+        doc_id: Optional[str] = None,
+        user_id: str = "default",
+        mode: str = "hybrid",
+    ) -> Generator[Dict[str, Any], None, None]:
+        if session_id:
+            session = self.conversation_memory.get_session(session_id)
+            if not session:
+                self.conversation_memory.create_session(
+                    user_id=user_id,
+                    title=f"Session {session_id[:12]}",
+                )
+            self.conversation_memory.add_message(
+                session_id, "user", message,
+                metadata={"source": "learning_loop"},
+            )
+        for event in self.learning_loop.process(
+            message, session_id=session_id, doc_id=doc_id,
+            user_id=user_id, mode=mode,
+        ):
+            yield event
+
+    def _should_reflect(self, answer: str, question: str) -> Optional[int]:
+        if not answer or len(answer.strip()) < 30:
+            return 0
+        low_quality_patterns = [
+            "我无法", "无法回答", "不知道", "没有相关信息",
+            "上下文中没有", "无法提供", "I cannot", "I don't know",
+        ]
+        for pattern in low_quality_patterns:
+            if pattern in answer:
+                return 0
+        if answer.count("来源") == 0 and len(answer) > 100:
+            return 1
+        return None
+
+    def _rewrite_for_reflection(self, question: str, previous_answer: str, attempt: int) -> str:
+        if not self.llm_func:
+            return question
+        try:
+            prompt = self.render_prompt("reflection_rewrite",
+                question=question,
+                previous_answer=previous_answer[:200],
+            )
+            rewritten = self.llm_func(prompt).strip()
+            if rewritten and len(rewritten) > 5 and rewritten != question:
+                return rewritten
+        except Exception as e:
+            logger.warning(f"Query rewriting for reflection failed: {e}")
+        return question
 
     def ingest(self, text: str, doc_id: str = "", title: str = "", tags: Optional[List[str]] = None) -> Dict[str, Any]:
         start = time.time()
@@ -133,6 +331,66 @@ class EnhancedRAGPipeline:
         kg_result = self.knowledge_graph.build_from_nodes(l2_dicts, doc_id)
         kg_time = time.time() - start
 
+        start = time.time()
+        l3_dicts = [{"node_id": n.node_id, "title": n.title, "content": n.content} for n in l3_nodes]
+        distiller = KnowledgeDistiller(llm_func=self.llm_func)
+        knowledge_units = distiller.distill(l3_dicts, doc_id)
+        concept_dicts = [u.to_dict() for u in knowledge_units]
+        if concept_dicts and self.embed_func:
+            self.storage.store_concepts(concept_dicts, self.embed_func)
+        for unit in knowledge_units:
+            self.progress_tracker.record_exposure(
+                knowledge_node_id=unit.concept,
+                title=unit.concept,
+                metadata={
+                    "bloom_level": unit.bloom_level,
+                    "difficulty": unit.difficulty,
+                    "source_nodes": unit.source_node_ids,
+                    "keywords": unit.keywords,
+                    "is_distilled": True,
+                },
+            )
+        for unit in knowledge_units:
+            entity_properties = {
+                "definition": unit.definition,
+                "bloom_level": unit.bloom_level,
+                "difficulty": str(unit.difficulty),
+                "keywords": json.dumps(unit.keywords, ensure_ascii=False),
+                "examples": json.dumps(unit.examples, ensure_ascii=False),
+                "source_node_ids": json.dumps(unit.source_node_ids, ensure_ascii=False),
+                "is_distilled": "true",
+            }
+            self.knowledge_graph._find_or_create_entity(
+                unit.concept, "distilled_concept",
+                unit.source_node_ids[0] if unit.source_node_ids else "",
+                doc_id,
+                properties=entity_properties,
+            )
+            if unit.prerequisites:
+                for prereq_name in unit.prerequisites:
+                    try:
+                        self.knowledge_graph._find_or_create_entity(
+                            prereq_name, "distilled_concept",
+                            unit.source_node_ids[0] if unit.source_node_ids else "",
+                            doc_id,
+                        )
+                        prereq_entity = self.knowledge_graph._find_entity_by_name(prereq_name)
+                        concept_entity = self.knowledge_graph._find_entity_by_name(unit.concept)
+                        if prereq_entity and concept_entity:
+                            relation = Relation(
+                                source_entity_id=prereq_entity.entity_id,
+                                target_entity_id=concept_entity.entity_id,
+                                relation_type="prerequisite_of",
+                                description=f"{prereq_name} 是 {unit.concept} 的前置知识",
+                                doc_id=doc_id,
+                            )
+                            self.knowledge_graph._save_relation(relation)
+                    except Exception as e:
+                        logger.warning(f"Failed to save prerequisite relation for {prereq_name} -> {unit.concept}: {e}")
+                        continue
+
+        distill_time = time.time() - start
+
         self.document_manager.register_document(
             doc_id=doc_id,
             title=title or doc_id,
@@ -150,16 +408,30 @@ class EnhancedRAGPipeline:
         for node in nodes:
             level_counts[node.level] = level_counts.get(node.level, 0) + 1
 
+        self.event_bus.publish(
+            "document:ingested", "pipeline",
+            payload={
+                "doc_id": doc_id,
+                "title": title,
+                "node_count": len(nodes),
+                "level_counts": level_counts,
+                "distilled_units": len(knowledge_units),
+                "kg_entities": kg_result.get("total_entities", 0),
+            },
+        )
+
         return {
             "doc_id": doc_id,
             "total_nodes": len(nodes),
             "level_counts": level_counts,
             "exposed_knowledge_nodes": len(l2_nodes),
+            "distilled_knowledge_units": len(knowledge_units),
             "kg_entities": kg_result.get("total_entities", 0),
             "kg_relations": kg_result.get("total_relations", 0),
             "chunk_time_ms": round(chunk_time * 1000, 2),
             "store_time_ms": round(store_time * 1000, 2),
             "kg_build_time_ms": round(kg_time * 1000, 2),
+            "distill_time_ms": round(distill_time * 1000, 2),
         }
 
     def query(
@@ -189,7 +461,11 @@ class EnhancedRAGPipeline:
             use_rewriting = resolved.get("use_rewriting", use_rewriting)
 
         if session_id and use_conversation_context:
-            conv_context = self.conversation_memory.get_context_window(session_id)
+            conv_context = self.conversation_memory.get_full_context(
+                session_id, query=question, max_tokens=4000,
+                include_relevant_history=True,
+                include_user_preferences=True,
+            )
         else:
             conv_context = []
 
@@ -222,7 +498,7 @@ class EnhancedRAGPipeline:
                 )
                 all_candidates.append(results)
 
-            candidates = self._merge_retrieval_results(all_candidates, top_k=per_query_top_k)
+            candidates = merge_retrieval_results(all_candidates, top_k=per_query_top_k)
         else:
             candidates = self.hybrid_retriever.search(
                 question, top_k=top_k * 3, doc_id=doc_id, use_hybrid=use_hybrid
@@ -282,9 +558,25 @@ class EnhancedRAGPipeline:
                     r["context_chain"]["l2_title"],
                     r["context_chain"]["l3_title"],
                 ])),
+                "node_id": r.get("l3_node_id", ""),
             }
             for i, r in enumerate(enriched)
         ]
+
+        concept_sources = []
+        if candidates and self.embed_func:
+            query_vec = self.embed_func([question])
+            if query_vec and len(query_vec) > 0:
+                concept_results = self.storage.search_concepts(query_vec[0], top_k=3, doc_id=doc_id)
+                for cr in concept_results:
+                    concept_sources.append({
+                        "concept": cr.get("concept", ""),
+                        "definition": cr.get("definition", ""),
+                        "bloom_level": cr.get("bloom_level", ""),
+                        "prerequisites": cr.get("prerequisites", []),
+                        "difficulty": cr.get("difficulty", 0),
+                        "score": cr.get("score", 0),
+                    })
 
         for r in enriched:
             node_id = r.get("l3_node_id", "")
@@ -303,9 +595,12 @@ class EnhancedRAGPipeline:
 
         return {
             "question": question,
+            "session_id": session_id or "",
+            "user_id": "default",
             "contexts": contexts,
             "context_chains": context_chain_info,
             "context_sources": context_sources,
+            "concept_sources": concept_sources,
             "num_contexts": len(contexts),
             "strategy": retrieval_strategy,
             "conversation_context": conv_context if session_id else [],
@@ -316,29 +611,6 @@ class EnhancedRAGPipeline:
         }
 
     @staticmethod
-    def _merge_retrieval_results(
-        all_results: List[List[Dict]], top_k: int
-    ) -> List[Dict]:
-        seen = {}
-        for results in all_results:
-            for r in results:
-                node_id = r["node_id"]
-                score_key = "rrf_score" if "rrf_score" in r else "score"
-                score = r.get(score_key, 0)
-                if node_id not in seen or score > seen[node_id].get(score_key, 0):
-                    if node_id not in seen:
-                        seen[node_id] = dict(r)
-                    else:
-                        seen[node_id].update(r)
-                        seen[node_id][score_key] = score
-
-        sorted_results = sorted(
-            seen.values(),
-            key=lambda x: x.get("rrf_score", x.get("score", 0)),
-            reverse=True,
-        )
-        return sorted_results[:top_k]
-
     def ask(
         self,
         question: str,
@@ -346,10 +618,9 @@ class EnhancedRAGPipeline:
         doc_id: Optional[str] = None,
         use_adaptive: bool = True,
     ) -> Dict[str, Any]:
-        result = self.qa_engine.ask(
-            question, session_id=session_id, doc_id=doc_id, use_adaptive=use_adaptive
+        return self.dispatch(
+            question, session_id=session_id, doc_id=doc_id, force_intent="qa"
         )
-        return result.to_dict()
 
     def generate_answer(self, question: str, pipeline_result: Dict) -> str:
         if not self.llm_func:
@@ -375,31 +646,63 @@ class EnhancedRAGPipeline:
         numbered = [f"[来源 {i+1}]\n{ctx}" for i, ctx in enumerate(contexts)]
         context_text = "\n\n---\n\n".join(numbered)
 
+        concept_text = ""
+        concept_sources = pipeline_result.get("concept_sources", [])
+        if concept_sources:
+            concept_parts = []
+            for c in concept_sources[:3]:
+                name = c.get("concept", "")
+                definition = c.get("definition", "")
+                bloom = c.get("bloom_level", "")
+                prereqs = c.get("prerequisites", [])
+                if name and definition:
+                    prereq_str = f"，前置: {'、'.join(prereqs[:3])}" if prereqs else ""
+                    concept_parts.append(f"- **{name}** (Bloom: {bloom}{prereq_str}): {definition[:200]}")
+            if concept_parts:
+                concept_text = "\n\n[相关概念定义]\n" + "\n".join(concept_parts)
+
         conv_context = pipeline_result.get("conversation_context", [])
         conv_text = ""
         if conv_context:
             conv_parts = []
-            for msg in conv_context[-6:]:
-                role = msg.get("role", "user")
+            for msg in conv_context:
+                role = msg.get("role", "system")
                 content = msg.get("content", "")
-                conv_parts.append(f"[{role}]: {content[:200]}")
-            conv_text = "\n对话历史:\n" + "\n".join(conv_parts) + "\n\n"
+                if not content.strip():
+                    continue
+                label = {
+                    "system": "记忆",
+                    "user": "用户",
+                    "assistant": "助手",
+                }.get(role, role)
+                conv_parts.append(f"[{label}]: {content}")
+            if conv_parts:
+                conv_text = "\n对话上下文:\n" + "\n".join(conv_parts) + "\n\n"
 
-        prompt = f"""基于以下上下文信息回答问题。如果上下文中没有相关信息，请说明。
+        learning_context = ""
+        if self.learning_context:
+            session_id = pipeline_result.get("session_id", "")
+            user_id = pipeline_result.get("user_id", "default")
+            learning_context = self.learning_context.build_system_context(user_id, session_id)
 
-引用来源规则：
-- 回答中引用某个来源时，请在句末标注 [来源 X]
-- 如果一句话综合了多个来源，标注 [来源 1][来源 2]
-- 每个来源至少引用一次
+        review_hint = ""
+        try:
+            user_id = pipeline_result.get("user_id", "default")
+            due = self.progress_tracker.get_due_reviews(user_id, limit=3)
+            if due:
+                items = [f"- {r['title']}（掌握度: {r['mastery']}）" for r in due]
+                review_hint = "\n\n[复习提醒] 用户以下知识点待复习，可在回答末尾自然提及：\n" + "\n".join(items)
+        except Exception as e:
+            logger.warning(f"Failed to get review hints: {e}")
 
-{conv_text}上下文:
-{context_text}
-
-问题: {question}
-
-请给出详细、准确的回答:"""
-
-        return prompt
+        system_prompt = self.render_prompt("system", learning_context=learning_context + review_hint)
+        return self.render_prompt("qa",
+            system_prompt=system_prompt,
+            conv_text=conv_text,
+            context_text=context_text + concept_text,
+            kg_text="",
+            question=question,
+        )
 
     def create_session(self, user_id: str = "default", title: str = "") -> Dict[str, Any]:
         session = self.conversation_memory.create_session(user_id, title)
@@ -474,6 +777,46 @@ class EnhancedRAGPipeline:
     def search_kg_entities(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
         return self.knowledge_graph.search_entities(query, limit)
 
+    def unified_query(
+        self,
+        query: str,
+        user_id: str = "default",
+        limit: int = 10,
+        doc_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        kg_entities = self.knowledge_graph.search_entities(query, limit=limit)
+
+        concept_results = []
+        if self.embed_func:
+            try:
+                qvec = self.embed_func([query])
+                if qvec and len(qvec) > 0:
+                    concept_results = self.storage.search_concepts(qvec[0], top_k=limit, doc_id=doc_id)
+            except Exception as e:
+                logger.warning(f"Concept search failed for query '{query[:30]}': {e}")
+
+        tracker_results = []
+        try:
+            escaped = escape_like(query)
+            cursor = self.progress_tracker.db.execute(
+                "SELECT knowledge_node_id, title, mastery FROM knowledge_records "
+                "WHERE user_id = ? AND (title LIKE ? ESCAPE '\\' OR knowledge_node_id LIKE ? ESCAPE '\\') LIMIT ?",
+                (user_id, f"%{escaped}%", f"%{escaped}%", limit),
+            )
+            tracker_results = [
+                {"node_id": r[0], "name": r[1], "mastery": r[2], "source": "progress_tracker"}
+                for r in cursor.fetchall()
+            ]
+        except Exception as e:
+            logger.warning(f"Progress tracker search failed for query '{query[:30]}': {e}")
+
+        return {
+            "query": query,
+            "kg_entities": kg_entities,
+            "concepts": concept_results,
+            "tracker_records": tracker_results,
+        }
+
     def get_entity_relations(self, entity_name: str, depth: int = 1) -> Dict[str, Any]:
         entity = self.knowledge_graph.query_entity(entity_name)
         if not entity:
@@ -520,6 +863,12 @@ class EnhancedRAGPipeline:
     def get_study_recommendations(self, user_id: str = "default") -> List[Dict[str, Any]]:
         return self.analytics.get_study_recommendations(user_id)
 
+    def get_next_learning_steps(self, user_id: str = "default", limit: int = 5) -> List[Dict[str, Any]]:
+        return self.tutor_agent.get_next_steps(user_id, limit)
+
+    def generate_learning_path(self, goal: str, user_id: str = "default") -> List[Dict[str, Any]]:
+        return self.tutor_agent.generate_learning_path(goal, user_id)
+
     def get_knowledge_graph_insights(self, user_id: str = "default") -> Dict[str, Any]:
         return self.analytics.get_knowledge_graph_insights(user_id)
 
@@ -533,6 +882,107 @@ class EnhancedRAGPipeline:
     def delete_document(self, doc_id: str) -> bool:
         self.storage.delete_doc(doc_id)
         return self.document_manager.delete_document(doc_id)
+
+    @property
+    def active_course_id(self) -> str:
+        if self._active_course_id:
+            return self._active_course_id
+        courses = self.course_manager.list_courses()
+        if courses:
+            self._active_course_id = courses[0]["course_id"]
+            return self._active_course_id
+        course = self.course_manager.create_course("通用学习")
+        self._active_course_id = course.course_id
+        return self._active_course_id
+
+    def set_active_course(self, course_id: str):
+        self._active_course_id = course_id
+
+    def list_courses(self) -> List[Dict[str, Any]]:
+        return self.course_manager.list_courses()
+
+    def create_course(self, name: str, description: str = "") -> Dict[str, Any]:
+        course = self.course_manager.create_course(name, description)
+        self._active_course_id = course.course_id
+        return course.to_dict()
+
+    def modify_ingest_for_course(self, text: str, doc_id: str = "", title: str = "",
+                                  tags: Optional[List[str]] = None,
+                                  course_id: Optional[str] = None) -> Dict[str, Any]:
+        if course_id is None:
+            course_id = self.active_course_id
+        if tags is None:
+            tags = []
+        if f"course:{course_id}" not in tags:
+            tags.append(f"course:{course_id}")
+        result = self.ingest(text, doc_id=doc_id, title=title, tags=tags)
+        course = self.course_manager.get_course(course_id)
+        if course:
+            all_docs = self.document_manager.list_documents(tag=f"course:{course_id}", limit=100)
+            total_nodes = sum(d.get("node_count", 0) for d in all_docs)
+            total_entities = sum(d.get("entity_count", 0) for d in all_docs)
+            self.course_manager.update_course_stats(
+                course_id, doc_count=len(all_docs), node_count=total_nodes, entity_count=total_entities,
+            )
+        return result
+
+    def get_background_notifications(self, clear: bool = True) -> list:
+        return self.background_agent.get_notifications(clear)
+
+    def start_background_agent(self):
+        self.background_agent.start()
+
+    def eval_intent_router(self, test_cases: List[tuple]) -> Dict[str, Any]:
+        correct = 0
+        results = []
+        for msg, expected_label in test_cases:
+            result = self.intent_router.route(msg)
+            is_correct = result.intent.label == expected_label
+            if is_correct:
+                correct += 1
+            results.append({
+                "message": msg[:50],
+                "expected": expected_label,
+                "got": result.intent.label,
+                "confidence": result.confidence,
+                "correct": is_correct,
+            })
+        total = len(test_cases)
+        return {
+            "accuracy": round(correct / total, 3) if total > 0 else 0,
+            "correct": correct,
+            "total": total,
+            "results": results,
+        }
+
+    def eval_orchestrator_tool_selection(self, test_cases: List[tuple]) -> Dict[str, Any]:
+        results = []
+        for msg, expected_tool in test_cases:
+            intent_result = self.intent_router.route(msg)
+            prompt = f"你是一个AI助手的决策核心。\n\n可用工具:\n{self.tool_registry.build_tools_description()}\n\n用户消息: {msg}\n\n输出JSON: {{\"action\": \"工具名\", \"params\": {{}}}}或{{\"answer\": \"直接回答\"}}"
+            try:
+                response = self.llm_func(prompt) if self.llm_func else ""
+                import json
+                clean = response.strip()
+                if clean.startswith("```"):
+                    clean = clean.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+                parsed = json.loads(clean)
+                selected = parsed.get("action", "direct_answer")
+            except Exception:
+                selected = "parse_failed"
+            results.append({
+                "message": msg[:50],
+                "expected_tool": expected_tool,
+                "selected": selected,
+                "correct": selected == expected_tool,
+            })
+        correct = sum(1 for r in results if r["correct"])
+        return {
+            "accuracy": round(correct / len(test_cases), 3) if test_cases else 0,
+            "correct": correct,
+            "total": len(test_cases),
+            "results": results,
+        }
 
     def evaluate(
         self,

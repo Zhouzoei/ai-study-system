@@ -23,8 +23,6 @@ class CrossEncoderReranker:
         try:
             import os
             os.environ["HF_HUB_OFFLINE"] = "1"
-            os.environ["CURL_CA_BUNDLE"] = ""
-            os.environ["REQUESTS_CA_BUNDLE"] = ""
             from sentence_transformers import CrossEncoder
             self.model = CrossEncoder(self.model_name)
             print(f"[Reranker] Cross-Encoder model loaded: {self.model_name}")
